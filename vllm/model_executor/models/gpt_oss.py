@@ -52,7 +52,6 @@ from .utils import (
 # NOTE(ducct) 
 from vllm.logger import init_logger
 import vllm.envs as envs
-import nvtx
 
 import time
 import torch
@@ -63,7 +62,7 @@ TIMING_LOG_PATH = Path(f"/home/ducct/repos/profiling/trace-analysis/vllm-offload
 def log_header_if_needed():
     if not TIMING_LOG_PATH.exists():
         with TIMING_LOG_PATH.open("w") as f:
-            f.write("step,layer,gpu_id,attn_ms,attn_input_shape,mlp_ms,mlp_input_shape\n")
+            f.write("step,layer,gpu_id,attn_ms,mlp_ms\n")
 
 def log_attn_mlp(step_num: int, layer_id: int, attn_ms: float, mlp_ms: float, device) -> None:
     log_header_if_needed()

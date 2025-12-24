@@ -78,6 +78,28 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# NOTE(ducct)
+# NOTE(ducct) 
+import vllm.envs as envs
+
+import time
+import torch
+from pathlib import Path
+
+TIMING_LOG_PATH = Path(f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/timing/{envs.LOG_SUFFIX}.csv")
+
+def log_header_if_needed():
+    if not TIMING_LOG_PATH.exists():
+        with TIMING_LOG_PATH.open("w") as f:
+            f.write("step,layer,gpu_id,attn_ms,mlp_ms\n")
+
+def log_attn_mlp(step_num: int, layer_id: int, attn_ms: float, mlp_ms: float, device) -> None:
+    log_header_if_needed()
+    gpu_id = getattr(device, "index", -1)  # -1 for CPU
+    with TIMING_LOG_PATH.open("a") as f:
+        f.write(f"{step_num},{layer_id},{gpu_id},{attn_ms:.4f},{mlp_ms:.4f}\n")
+
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -378,14 +400,42 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # NOTE(ducct)
+        if envs.ENABLE_LATENCY_PROFILE:
+            is_cuda = hidden_states.is_cuda
+            device = hidden_states.device if is_cuda else torch.device("cpu")
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t1 = time.perf_counter()
+            attn_input_shape = hidden_states.shape
+            attn_ms = (t1 - t0) * 1000.0
+
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # NOTE(ducct)
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t2 = time.perf_counter()
+            mlp_input_shape = hidden_states.shape
         hidden_states = self.mlp(hidden_states)
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t3 = time.perf_counter()
+            mlp_ms = (t3 - t2) * 1000.0
+            log_attn_mlp(envs.STEP_NUM, envs.LAYER_ID, attn_ms, mlp_ms, device)
+
         return hidden_states, residual
 
 
@@ -447,6 +497,10 @@ class Qwen3MoeModel(nn.Module):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            # NOTE(ducct)
+            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
+                envs.LAYER_ID = layer_idx
+
             # Collect auxiliary hidden states if specified
             if layer_idx in self.aux_hidden_state_layers:
                 aux_hidden_state = (
