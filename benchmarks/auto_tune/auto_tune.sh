@@ -6,10 +6,11 @@
 TAG=$(date +"%Y_%m_%d_%H_%M")
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
-BASE=${BASE:-"$SCRIPT_DIR/../../.."}
+BASE=${BASE:-"$SCRIPT_DIR"}
 MODEL=${MODEL:-"meta-llama/Llama-3.1-8B-Instruct"}
 SYSTEM=${SYSTEM:-"TPU"}
 TP=${TP:-1}
+DP=${DP:-1}
 DOWNLOAD_DIR=${DOWNLOAD_DIR:-""}
 INPUT_LEN=${INPUT_LEN:-4000}
 OUTPUT_LEN=${OUTPUT_LEN:-16}
@@ -86,6 +87,9 @@ start_server() {
         "--max-num-seqs" "$max_num_seqs"
         "--max-num-batched-tokens" "$max_num_batched_tokens"
         "--tensor-parallel-size" "$TP"
+		"--data-parallel-size" "$DP" # NOTE(ducct)
+		"--enable-expert-parallel" # NOTE(ducct)
+		"--enforce-eager" # NOTE(ducct)
         "--enable-prefix-caching"
         "--load-format" "dummy"
         "--download-dir" "$DOWNLOAD_DIR"

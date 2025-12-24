@@ -238,6 +238,14 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
 
+    # NOTE(ducct)
+    ENABLE_NVTX: bool = False
+    ENABLE_LATENCY_PROFILE: bool = False
+    ENABLE_EXPERT_ACTIVATION_PROFILE: bool = False
+    LAYER_ID: int = 0
+    STEP_NUM: int = 0
+    LOG_SUFFIX: str = ""
+
 
 def get_default_cache_root():
     return os.getenv(
@@ -1555,6 +1563,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),
+
+    # NOTE(ducct)
+    "ENABLE_NVTX": lambda: bool(
+        int(os.getenv("ENABLE_NVTX", "0"))
+    ),
+    "ENABLE_LATENCY_PROFILE": lambda: bool(
+        int(os.getenv("ENABLE_LATENCY_PROFILE", "0"))
+    ),
+    "ENABLE_EXPERT_ACTIVATION_PROFILE": lambda: bool(
+        int(os.getenv("ENABLE_EXPERT_ACTIVATION_PROFILE", "0"))
+    ),
+    "LAYER_ID": lambda: int(
+        int(os.getenv("LAYER_ID", 0))
+    ),
+    "STEP_NUM": lambda: int(
+        int(os.getenv("STEP_NUM", 0))
+    ),
+    "LOG_SUFFIX": lambda: os.getenv("LOG_SUFFIX", ""),
 }
 
 # --8<-- [end:env-vars-definition]

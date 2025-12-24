@@ -157,24 +157,45 @@ class TorchCompileWithNoGuardsWrapper:
         return self._compiled_callable.aot_compile((args, kwargs))
 
     def __call__(self, *args, **kwargs):
+        # NOTE(ducct)
+        logger.info(f"Yooo, I'm called bro")
+        # TODO: set ENABLE_NVTX=False here
+        envs.ENABLE_NVTX = False
+
         if envs.VLLM_USE_BYTECODE_HOOK:
             if (
                 self.vllm_config.compilation_config.mode
                 == CompilationMode.STOCK_TORCH_COMPILE
             ):
+                # NOTE(ducct)
+                logger.info(f"Compiled STOCK_TORCH_COMPILE")
+
                 return self._compiled_callable(*args, **kwargs)
 
             if not self._compiled_bytecode:
                 # Make sure a compilation is triggered by clearing dynamo
                 # cache.
                 torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
+                # NOTE(ducct)
+                logger.info(f"Compiled BYTECODE")
+
                 return self._compiled_callable(*args, **kwargs)
             else:
                 with self._dispatch_to_compiled_code():
+                    # NOTE(ducct)
+                    logger.info(f"No recompilation, use cached compile code")
+                    # TODO: set ENABLE_NVTX=True here
+                    envs.ENABLE_NVTX = True
+
                     return self.forward(*args, **kwargs)
         else:
             with _compilation_context():
+                # NOTE(ducct)
+                logger.info(f"Compiled context")
                 return self._compiled_callable(*args, **kwargs)
+
+        # NOTE(ducct)
+        logger.info(f"No Compilation happens")
 
     @abstractmethod
     def forward(self, *args, **kwargs): ...

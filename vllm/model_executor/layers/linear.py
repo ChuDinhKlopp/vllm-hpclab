@@ -562,6 +562,10 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
+
+        # NOTE(ducct)
+        # logger.info(f"self.quant_method: {self.quant_method}")
+
         output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
@@ -1012,6 +1016,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
+
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
                 param.load_qkv_weight(
@@ -1058,6 +1063,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
+
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:

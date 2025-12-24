@@ -357,6 +357,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             router_logits=router_logits,
         )
 
+        # NOTE(ducct)
+        if envs.ENABLE_EXPERT_ACTIVATION_PROFILE:
+            logger.info(f"topk_ids: {topk_ids}")
+
         if self.rocm_aiter_moe_enabled:
             result = self.rocm_aiter_fused_experts(
                 hidden_states=x,

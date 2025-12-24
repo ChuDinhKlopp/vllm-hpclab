@@ -95,7 +95,6 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 
 logger = init_logger(__name__)
 
-
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
@@ -1891,6 +1890,7 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        
         assert self.quant_method is not None
 
         self.ensure_moe_quant_config_init()
@@ -1937,6 +1937,7 @@ class FusedMoE(CustomOp):
                 hidden_states_combined, router_logits = get_ep_group().dispatch(
                     hidden_states, router_logits, self.is_sequence_parallel
                 )
+                
             # Run shared experts before matrix multiply.
             # because matrix multiply maybe modify the hidden_states.
             if has_separate_shared_experts and not use_shared_experts_stream:
@@ -1955,7 +1956,7 @@ class FusedMoE(CustomOp):
                     router_logits,
                     dim=0,
                 )
-
+            
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
@@ -2029,6 +2030,7 @@ class FusedMoE(CustomOp):
                 return (combine_output(final_hidden_states), zero_expert_result)
             else:
                 return combine_output(final_hidden_states)
+
 
     @classmethod
     def make_expert_params_mapping(

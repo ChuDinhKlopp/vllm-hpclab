@@ -529,6 +529,11 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
         return module
 
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+
+    # NOTE(ducct):
+    # print(f"_CPU_OFFLOAD_BYTES: {_CPU_OFFLOAD_BYTES}")
+    # print(f"_CPU_OFFLOAD_MAX_BYTES: {_CPU_OFFLOAD_MAX_BYTES}")
+
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 

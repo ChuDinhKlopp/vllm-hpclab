@@ -49,6 +49,28 @@ from .utils import (
     maybe_prefix,
 )
 
+# NOTE(ducct) 
+from vllm.logger import init_logger
+import vllm.envs as envs
+import nvtx
+
+import time
+import torch
+from pathlib import Path
+
+TIMING_LOG_PATH = Path(f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/timing/{envs.LOG_SUFFIX}.csv")
+
+def log_header_if_needed():
+    if not TIMING_LOG_PATH.exists():
+        with TIMING_LOG_PATH.open("w") as f:
+            f.write("step,layer,gpu_id,attn_ms,attn_input_shape,mlp_ms,mlp_input_shape\n")
+
+def log_attn_mlp(step_num: int, layer_id: int, attn_ms: float, mlp_ms: float, device) -> None:
+    log_header_if_needed()
+    gpu_id = getattr(device, "index", -1)  # -1 for CPU
+    with TIMING_LOG_PATH.open("a") as f:
+        f.write(f"{step_num},{layer_id},{gpu_id},{attn_ms:.4f},{mlp_ms:.4f}\n")
+
 
 class OAIAttention(nn.Module):
     def __init__(
@@ -131,7 +153,9 @@ class OAIAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
+
         qkv, _ = self.qkv_proj(hidden_states)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         v = v.contiguous()
@@ -188,6 +212,7 @@ class MLPBlock(torch.nn.Module):
             )
         else:
             g = self.router(x)
+        
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:
@@ -204,6 +229,7 @@ class TransformerBlock(torch.nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self._nvtx_dummy = torch.empty(0)
 
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
@@ -231,11 +257,39 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # NOTE(ducct) 
+        if envs.ENABLE_LATENCY_PROFILE:
+            is_cuda = hidden_states.is_cuda
+            device = hidden_states.device if is_cuda else torch.device("cpu")
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
         hidden_states = self.attn(hidden_states, positions)
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t1 = time.perf_counter()
+            attn_input_shape = hidden_states.shape
+            attn_ms = (t1 - t0) * 1000.0
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # NOTE(ducct) 
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t2 = time.perf_counter()
+            mlp_input_shape = hidden_states.shape
         output = self.mlp(hidden_states)
+        if envs.ENABLE_LATENCY_PROFILE:
+            if is_cuda:
+                torch.cuda.synchronize(device)
+            t3 = time.perf_counter()
+            mlp_ms = (t3 - t2) * 1000.0
+            log_attn_mlp(envs.STEP_NUM, envs.LAYER_ID, attn_ms, mlp_ms, device)
+
         return output, residual
 
 
@@ -248,6 +302,7 @@ class GptOssModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.parallel_config = vllm_config.parallel_config
@@ -295,10 +350,16 @@ class GptOssModel(nn.Module):
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            # NOTE(ducct)
+            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
+                envs.LAYER_ID = i
+
             layer = self.layers[i]
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
+
             x, residual = layer(x, positions, residual)
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
         x, _ = self.norm(x, residual)
@@ -702,6 +763,7 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.logger = init_logger(__name__)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -720,7 +782,9 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        out = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+
+        return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)

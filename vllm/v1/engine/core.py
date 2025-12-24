@@ -65,6 +65,9 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
+# NOTE(ducct)
+import vllm.envs as envs
+
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -857,6 +860,10 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            # NOTE(ducct)
+            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE:
+                envs.STEP_NUM += 1
+
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
@@ -1207,6 +1214,10 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            # NOTE(ducct)
+            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
+                envs.STEP_NUM += 1
+
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 

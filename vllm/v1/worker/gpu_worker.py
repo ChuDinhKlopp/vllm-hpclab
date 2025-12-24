@@ -412,6 +412,13 @@ class Worker(WorkerBase):
             capture_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
             if capture_sizes is not None:
                 warmup_sizes = [x for x in warmup_sizes if x not in capture_sizes]
+
+        # NOTE(ducct)
+        logger.info(f"[INFO] compile_sizes: {self.vllm_config.compilation_config.compile_sizes}")
+        logger.info(f"[INFO] cudagraph_capture_sizes: {self.vllm_config.compilation_config.cudagraph_capture_sizes}")
+        logger.info(f"[INFO] enforce_eager: {self.model_config.enforce_eager}")
+        logger.info(f"[INFO] warmup_sizes before loop: {warmup_sizes}")
+
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
@@ -508,6 +515,7 @@ class Worker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
