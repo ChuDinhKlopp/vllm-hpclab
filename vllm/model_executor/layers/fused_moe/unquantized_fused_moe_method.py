@@ -42,6 +42,105 @@ else:
 
 logger = init_logger(__name__)
 
+# NOTE(ducct)
+import os
+from typing import List, Dict
+import torch
+EXPERT_ACTIVATION_LOG_DIR = f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/expert_activation_pattern/{envs.LOG_SUFFIX}/"
+
+class BatchedTensorLogger:
+    def __init__(
+        self,
+        log_dir: str = "tensor_logs",
+        batch_size: int = 1296,
+        max_steps_per_file: int = None,
+        filename_format: str = "device_{device:01d}_{start:06d}_{end:06d}.pt",
+    ):
+        self.log_dir = log_dir
+        self.batch_size = batch_size
+        self.max_steps_per_file = max_steps_per_file
+        self.filename_format = filename_format
+
+        self.buffer: List[Dict] = []
+        self.current_start_step = None
+        self.current_device_id = None  # NEW
+
+        os.makedirs(log_dir, exist_ok=True)
+
+    @staticmethod
+    def _normalize_device_id(device: torch.device) -> int:
+        if device.type == "cuda":
+            return device.index
+        return 0  # CPU → device_0
+
+    def log(self, step: int, layer_id: int, tensor: torch.Tensor, device_id: torch.device, **metadata):
+        device_id = self._normalize_device_id(device_id)
+
+        # If device changes mid-buffer → flush
+        if self.current_device_id is not None and device_id != self.current_device_id:
+            self.flush()
+
+        if self.current_start_step is None:
+            self.current_start_step = step
+            self.current_device_id = device_id
+
+        entry = {
+            "step": step,
+            "layer": layer_id,
+            "tensor": tensor.cpu().clone(),
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device_id": device_id,
+            **metadata,
+        }
+
+        self.buffer.append(entry)
+
+        if self.max_steps_per_file:
+            if step - self.current_start_step >= self.max_steps_per_file:
+                self.flush()
+        elif len(self.buffer) >= self.batch_size:
+            self.flush()
+
+    def flush(self):
+        if not self.buffer:
+            return
+
+        steps = [e["step"] for e in self.buffer]
+        start_step = min(steps)
+        end_step = max(steps)
+
+        device_id = self.current_device_id
+
+        filename = self.filename_format.format(
+            device=device_id,
+            start=start_step,
+            end=end_step,
+        )
+        filepath = os.path.join(self.log_dir, filename)
+
+        batch_data = {
+            "entries": self.buffer,
+            "count": len(self.buffer),
+            "step_range": (start_step, end_step),
+            "device_id": device_id,
+            "layer_ids": list({e["layer"] for e in self.buffer}),
+            "shapes": list({e["shape"] for e in self.buffer}),
+        }
+
+        torch.save(batch_data, filepath)
+        print(f"Saved {len(self.buffer)} tensors to {filename}")
+
+        self.buffer = []
+        self.current_start_step = None
+        self.current_device_id = None
+
+    def close(self):
+        if self.buffer:
+            self.flush()
+
+batched_logger = BatchedTensorLogger(log_dir=EXPERT_ACTIVATION_LOG_DIR, max_steps_per_file=10)
+
 
 @CustomOp.register("unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -294,7 +393,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             assert expert_load_view is not None
             assert logical_to_physical_map is not None
             assert logical_replica_count is not None
-
+            
         return self.forward(
             x=x,
             layer=layer,
@@ -358,8 +457,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         # NOTE(ducct)
-        if envs.ENABLE_EXPERT_ACTIVATION_PROFILE:
-            logger.info(f"topk_ids: {topk_ids}")
+        if envs.ENABLE_EXPERT_ACTIVATION_PROFILE and envs.STEP_NUM != 0:
+            device_id = x.device if x.is_cuda else torch.device("cpu")
+            # logger.info(f"STEP: {envs.STEP_NUM}; LAYER: {envs.LAYER_ID}; device: {device_id}; topk ids: {topk_ids} - {topk_ids.shape}")
+            batched_logger.log(step=envs.STEP_NUM, layer_id=envs.LAYER_ID, tensor=topk_ids, device_id=device_id)
 
         if self.rocm_aiter_moe_enabled:
             result = self.rocm_aiter_fused_experts(

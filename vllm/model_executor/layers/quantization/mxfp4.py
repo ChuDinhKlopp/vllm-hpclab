@@ -63,13 +63,9 @@ logger = init_logger(__name__)
 
 # NOTE(ducct)
 import os
-
-EXPERT_ACTIVATION_LOG_DIR = f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/expert_activation_pattern/{envs.LOG_SUFFIX}/"
-
-import os
 from typing import List, Dict
 import torch
-
+EXPERT_ACTIVATION_LOG_DIR = f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/expert_activation_pattern/{envs.LOG_SUFFIX}/"
 
 class BatchedTensorLogger:
     def __init__(
@@ -1023,7 +1019,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             # NOTE(ducct)
-            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE:
+            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE and envs.STEP_NUM != 0:
                 device_id = x.device if x.is_cuda else torch.device("cpu")
                 # logger.info(f"STEP: {envs.STEP_NUM}; LAYER: {envs.LAYER_ID}; device: {device_id}; topk ids: {topk_ids} - {topk_ids.shape}")
                 batched_logger.log(step=envs.STEP_NUM, layer_id=envs.LAYER_ID, tensor=topk_ids, device_id=device_id)
