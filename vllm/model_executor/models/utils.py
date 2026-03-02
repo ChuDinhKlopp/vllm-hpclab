@@ -519,20 +519,65 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
 
 
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+# NOTE(ducct): offload all non-cache tensors to CPU, keeping all cache tensors on GPU
+def my_offload(module: torch.nn.Module) -> torch.nn.Module:
+    # NOTE(ducct): if no param in the module, return
     if (params := next(module.parameters(), None)) is None:
         return module
 
     device = params.device
+    
+    # NOTE(ducct): if the param is already on CPU, return
+    if device == torch.device("cpu"):
+        return module
 
+    # offload parameters to CPU
+    # use pin_memory if possible, which helps cudagraph capture speed
+    offloaded_parameters = False
+    offload_w = (
+        "mlp.experts.w13_weight",
+        "mlp.experts.w13_weight_scale",
+        "mlp.experts.w13_bias",
+        "mlp.experts.w2_weight",
+        "mlp.experts.w2_weight_scale",
+        "mlp.experts.w2_bias",
+    )
+    pin_memory = is_pin_memory_available()
+    for name, p in module.named_parameters():
+        if name.endswith(offload_w):
+            cpu_data = torch.empty_strided(
+                size=p.data.size(),
+                stride=p.data.stride(),
+                dtype=p.data.dtype,
+                layout=p.data.layout,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            cpu_data.copy_(p.data)
+            p.data = cpu_data
+
+    return module
+
+            
+def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    # NOTE(ducct):
+    for name, param in module.named_parameters():
+        print(name, tuple(param.shape))
+    # NOTE(ducct): if no param in the module, return
+    if (params := next(module.parameters(), None)) is None:
+        return module
+
+    device = params.device
+    
+    # NOTE(ducct): if the param is already on CPU, return
     if device == torch.device("cpu"):
         return module
 
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
 
     # NOTE(ducct):
-    # print(f"_CPU_OFFLOAD_BYTES: {_CPU_OFFLOAD_BYTES}")
-    # print(f"_CPU_OFFLOAD_MAX_BYTES: {_CPU_OFFLOAD_MAX_BYTES}")
+    print(f"_CPU_OFFLOAD_BYTES: {_CPU_OFFLOAD_BYTES}")
+    print(f"_CPU_OFFLOAD_MAX_BYTES: {_CPU_OFFLOAD_MAX_BYTES}")
 
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
@@ -608,7 +653,8 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+            # maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")) # NOTE(ducct): layer_fn = TransformerBlock = MLP + Attn
+            my_offload(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
         ]
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+import time
 from enum import Enum
 from typing import Optional
 
@@ -351,6 +352,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "Please check your environment and try again."
         )
         self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+        self.expert_cache = None
 
     def create_weights(
         self,
@@ -502,6 +504,57 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_bias", w2_bias)
         set_weight_attrs(w2_bias, extra_weight_attrs)
+
+        # NOTE(ducct): register expert cache params
+        # NOTE(ducct): initialize expert cache
+        layer.expert_cache.create_cache(
+            intermediate_size_per_partition_after_pad, 
+            hidden_size, 
+            mxfp4_block,
+            weight_dtype,
+            scale_dtype,
+        )
+        # ping buffer
+        layer.register_parameter("expert_cache_ping_w13_weight", layer.expert_cache.ping_buffer.w13_weight)
+        if not hasattr(layer.expert_cache.ping_buffer.w13_weight, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w13_weight, extra_weight_attrs)
+        layer.register_parameter("expert_cache_ping_w13_weight_scale", layer.expert_cache.ping_buffer.w13_weight_scale)
+        if not hasattr(layer.expert_cache.ping_buffer.w13_weight_scale, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w13_weight_scale, extra_weight_attrs)
+        layer.register_parameter("expert_cache_ping_w13_bias", layer.expert_cache.ping_buffer.w13_bias)
+        if not hasattr(layer.expert_cache.ping_buffer.w13_bias, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w13_bias, extra_weight_attrs)
+        layer.register_parameter("expert_cache_ping_w2_weight", layer.expert_cache.ping_buffer.w2_weight)
+        if not hasattr(layer.expert_cache.ping_buffer.w2_weight, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w2_weight, extra_weight_attrs)
+        layer.register_parameter("expert_cache_ping_w2_weight_scale", layer.expert_cache.ping_buffer.w2_weight_scale)
+        if not hasattr(layer.expert_cache.ping_buffer.w2_weight_scale, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w2_weight_scale, extra_weight_attrs)
+        layer.register_parameter("expert_cache_ping_w2_bias", layer.expert_cache.ping_buffer.w2_bias)
+        if not hasattr(layer.expert_cache.ping_buffer.w2_bias, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.ping_buffer.w2_bias, extra_weight_attrs)
+
+        # pong buffer
+        layer.register_parameter("expert_cache_pong_w13_weight", layer.expert_cache.pong_buffer.w13_weight)
+        if not hasattr(layer.expert_cache.pong_buffer.w13_weight, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w13_weight, extra_weight_attrs)
+        layer.register_parameter("expert_cache_pong_w13_weight_scale", layer.expert_cache.pong_buffer.w13_weight_scale)
+        if not hasattr(layer.expert_cache.pong_buffer.w13_weight_scale, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w13_weight_scale, extra_weight_attrs)
+        layer.register_parameter("expert_cache_pong_w13_bias", layer.expert_cache.pong_buffer.w13_bias)
+        if not hasattr(layer.expert_cache.pong_buffer.w13_bias, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w13_bias, extra_weight_attrs)
+        layer.register_parameter("expert_cache_pong_w2_weight", layer.expert_cache.pong_buffer.w2_weight)
+        if not hasattr(layer.expert_cache.pong_buffer.w2_weight, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w2_weight, extra_weight_attrs)
+        layer.register_parameter("expert_cache_pong_w2_weight_scale", layer.expert_cache.pong_buffer.w2_weight_scale)
+        if not hasattr(layer.expert_cache.pong_buffer.w2_weight_scale, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w2_weight_scale, extra_weight_attrs)
+        layer.register_parameter("expert_cache_pong_w2_bias", layer.expert_cache.pong_buffer.w2_bias)
+        if not hasattr(layer.expert_cache.pong_buffer.w2_bias, "weight_loader"):
+            set_weight_attrs(layer.expert_cache.pong_buffer.w2_bias, extra_weight_attrs)
+
+
 
     def process_weights_after_loading(self, layer):
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
@@ -1012,38 +1065,105 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if enable_eplb:
             raise NotImplementedError("EPLB is not supported for mxfp4")
 
+        # NOTE(ducct): diagnostic print to verify device placement once
+        if not hasattr(layer, "_expert_cache_device_debugged"):
+            layer._expert_cache_device_debugged = True
+            try:
+                print("=== MoE device debug ===")
+                print("w13_weight:", layer.w13_weight.device, layer.w13_weight.dtype, layer.w13_weight.shape)
+                print("w2_weight:", layer.w2_weight.device, layer.w2_weight.dtype, layer.w2_weight.shape)
+                print(
+                    "cache ping w13:",
+                    layer.expert_cache.ping_buffer.w13_weight.device,
+                    layer.expert_cache.ping_buffer.w13_weight.dtype,
+                    layer.expert_cache.ping_buffer.w13_weight.shape,
+                )
+                print(
+                    "cache pong w13:",
+                    layer.expert_cache.pong_buffer.w13_weight.device,
+                    layer.expert_cache.pong_buffer.w13_weight.dtype,
+                    layer.expert_cache.pong_buffer.w13_weight.shape,
+                )
+            except Exception as exc:
+                print(f"MoE device debug failed: {exc}")
+
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             topk_weights, topk_ids, _ = layer.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
             )
+            # TODO(ducct): checking if selected experts (topk_ids) exist in the current layer's expert cache. The mapper is on CPU -> need to:
+            # 1. Get the unique set of topk_ids -> unique_expert_ids: done
+            active_cache = layer.expert_cache.get_active_buffer()
+            inactive_cache = layer.expert_cache.get_inactive_buffer()
+            print(f"active_buffer in mlp: {layer.expert_cache.active_buffer}")
+            if layer.expert_cache.active_buffer == "ping":
+                cached_expert_ids = layer.cached_expert_ids_ping
+            else:
+                cached_expert_ids = layer.cached_expert_ids_pong
+            print(f"layer {envs.LAYER_ID}: cached_expert_ids = {cached_expert_ids}")
+            print(f"layer {envs.LAYER_ID}: cached_expert_ids.device = {cached_expert_ids.device}")
+            print(f"cached_expert_ids.shape: {cached_expert_ids.shape}")
+            # 2. Transfer the topk_ids from GPU to CPU to compare with cached_expert_ids: done
+            unique_selected_ids = torch.unique(topk_ids.reshape(-1))
+            print(f"unique_selected_ids: {unique_selected_ids}")
+            print(f"unique_selected_ids.shape: {unique_selected_ids.shape}")
+            # 3. Do the checking on GPU
+            expert_mask = torch.isin(unique_selected_ids, cached_expert_ids, assume_unique=True) # check if unique_selected_ids is subset of cached_expert_ids
+            print(f"topk_ids.shape: {topk_ids.shape}")
+            is_subset = expert_mask.all().item()
+
+            if not is_subset:
+                missing_values = unique_selected_ids[~expert_mask]
+                cached_expert_ids = unique_selected_ids
+                print(f"No, it is not a subset")
+                print(f"Values in topk_ids that are missing: {missing_values}")
+                # 4. if there is missing ids in predicted ids, fetch to GPU on demand
+                # TODO(ducct): fetch on-demand missing experts into the cache. 
+                active_cache.fetch_on_demand(layer, missing_values.to("cpu"))
+            else:
+                print(f"Yes, it is a subset")
+
+            print(f"cached_expert_ids after fetch on-demand: {cached_expert_ids}")
 
             # NOTE(ducct)
             if envs.ENABLE_EXPERT_ACTIVATION_PROFILE and envs.STEP_NUM != 0:
                 device_id = x.device if x.is_cuda else torch.device("cpu")
-                # logger.info(f"STEP: {envs.STEP_NUM}; LAYER: {envs.LAYER_ID}; device: {device_id}; topk ids: {topk_ids} - {topk_ids.shape}")
                 batched_logger.log(step=envs.STEP_NUM, layer_id=envs.LAYER_ID, tensor=topk_ids, device_id=device_id)
 
-            return fused_marlin_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_bias,
-                layer.w2_bias,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
-                router_logits,
-                topk_weights,
-                topk_ids,
-                global_scale1=None,
-                global_scale2=None,
-                quant_type_id=scalar_types.float4_e2m1f.id,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                activation=activation,
-                expert_map=expert_map,
-                input_dtype=self.marlin_input_dtype,
-            )
+            # NOTE(ducct)
+            with torch.profiler.record_function("ducct::fused_marlin_moe"):
+                out = fused_marlin_moe(
+                    x,
+                    active_cache.w13_weight,          # NOTE(ducct)
+                    active_cache.w2_weight,           # NOTE(ducct)
+                    active_cache.w13_bias,            # NOTE(ducct)
+                    active_cache.w2_bias,             # NOTE(ducct)
+                    active_cache.w13_weight_scale,    # NOTE(ducct)
+                    active_cache.w2_weight_scale,     # NOTE(ducct)
+                    router_logits,
+                    topk_weights,
+                    topk_ids,
+                    global_scale1=None,
+                    global_scale2=None,
+                    quant_type_id=scalar_types.float4_e2m1f.id,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=layer.global_num_experts,
+                    activation=activation,
+                    expert_map=expert_map,
+                    input_dtype=self.marlin_input_dtype,
+                )
+
+            # NOTE(ducct): Check if inactive buffer is available (done prefetching).
+            # If not available yet, wait on the prefetch event before flipping.
+            if not inactive_cache.is_avail():
+                if torch.cuda.is_available() and inactive_cache.prefetch_event is not None:
+                    torch.cuda.current_stream().wait_event(inactive_cache.prefetch_event)
+                inactive_cache.avail = True
+            layer.expert_cache.flip_active_buffer()
+
+            return out
+            
 
         assert _can_support_mxfp4(
             use_grouped_topk,
@@ -1117,6 +1237,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_states=x,
                 router_logits=router_logits,
             )
+
+            # TODO(ducct): checking if selected experts (topk_ids) exist in the current layer's expert cache
 
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:

@@ -78,7 +78,6 @@ from .utils import (
 
 logger = init_logger(__name__)
 
-# NOTE(ducct)
 # NOTE(ducct) 
 import vllm.envs as envs
 
@@ -402,7 +401,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # NOTE(ducct)
-        if envs.ENABLE_LATENCY_PROFILE:
+        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
             is_cuda = hidden_states.is_cuda
             device = hidden_states.device if is_cuda else torch.device("cpu")
             if is_cuda:
@@ -412,7 +411,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-        if envs.ENABLE_LATENCY_PROFILE:
+        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
             if is_cuda:
                 torch.cuda.synchronize(device)
             t1 = time.perf_counter()
@@ -423,13 +422,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         # NOTE(ducct)
-        if envs.ENABLE_LATENCY_PROFILE:
+        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
             if is_cuda:
                 torch.cuda.synchronize(device)
             t2 = time.perf_counter()
             mlp_input_shape = hidden_states.shape
         hidden_states = self.mlp(hidden_states)
-        if envs.ENABLE_LATENCY_PROFILE:
+        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
             if is_cuda:
                 torch.cuda.synchronize(device)
             t3 = time.perf_counter()

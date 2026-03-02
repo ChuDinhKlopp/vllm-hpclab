@@ -91,6 +91,8 @@ def triton_kernel_moe_forward(
         gating_output, topk, sm_first=not renormalize
     )
 
+    # TODO(ducct): checking if selected experts (routing data) exist in expert cache
+
     output = torch.empty_like(hidden_states)
 
     return triton_kernel_fused_experts(

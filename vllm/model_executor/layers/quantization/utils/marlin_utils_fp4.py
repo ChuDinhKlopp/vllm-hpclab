@@ -233,18 +233,120 @@ def prepare_moe_fp4_layer_for_marlin(
     is_nvfp4 = hasattr(layer, "w13_weight_scale_2")
     group_size = 16 if is_nvfp4 else 32
 
-    e = layer.num_experts
+    e_cache = layer.expert_cache.ping_buffer.w13_weight.shape[0]
+    e = layer.w13_weight.shape[0]
     k = layer.hidden_size
     n = layer.intermediate_size_per_partition
 
     # WORKSPACE
-    device = layer.w13_weight.device
+    device = layer.expert_cache_ping_w13_weight.device # NOTE(ducct): added expert_cache_ prefix
     param_dtype = layer.params_dtype
     layer.workspace = marlin_make_workspace_new(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 
     # WEIGHT
+    # Repack weights to marlin format for ping/pong buffers
+    for prefix in ["expert_cache_ping", "expert_cache_pong"]:
+        buffer = layer.expert_cache.ping_buffer if "ping" in prefix else layer.expert_cache.pong_buffer
+        for suffix in ["w13_weight", "w2_weight"]:
+            name = f"{prefix}_{suffix}"
+            weight = getattr(layer, name)
+            tensor_list = []
+            if "w13_weight" in name:
+                size_n, size_k = n * 2, k
+            else:
+                size_n, size_k = k, n
+
+            assert weight.shape == (e_cache, size_n, size_k // 2)
+
+            for i in range(e_cache):
+                qweight = weight[i].view(torch.int32).T.contiguous()
+
+                marlin_qweight = ops.gptq_marlin_repack(
+                    b_q_weight=qweight,
+                    perm=perm,
+                    size_k=size_k,
+                    size_n=size_n,
+                    num_bits=4,
+                    is_a_8bit=is_a_8bit,
+                )
+                tensor_list.append(marlin_qweight)
+
+            weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            weight = torch.nn.Parameter(weight, requires_grad=False)
+
+            setattr(layer, name, weight)
+            setattr(buffer, suffix, weight)
+
+    # WEIGHT SCALES
+    # Permute scales for ping/pong buffers
+    for prefix in ["expert_cache_ping", "expert_cache_pong"]:
+        buffer = layer.expert_cache.ping_buffer if "ping" in prefix else layer.expert_cache.pong_buffer
+        for base in ["w13", "w2"]:
+            name = f"{prefix}_{base}"
+            scales = getattr(layer, name + "_weight_scale")
+            if not is_nvfp4:
+                scales = scales.view(torch.float8_e8m0fnu)
+            scales = scales.to(param_dtype)
+            if is_nvfp4:
+                global_scale = getattr(layer, name + "_weight_scale_2").to(param_dtype)
+
+            tensor_list = []
+            if "w13" in name:
+                size_n, size_k = n * 2, k
+            else:
+                size_n, size_k = k, n
+
+            for i in range(e_cache):
+                scale = scales[i].T
+
+                marlin_scales = marlin_permute_scales(
+                    s=scale,
+                    size_k=size_k,
+                    size_n=size_n,
+                    group_size=group_size,
+                    is_a_8bit=is_a_8bit,
+                )
+                if is_nvfp4:
+                    marlin_scales = nvfp4_marlin_process_scales(marlin_scales)
+                else:
+                    marlin_scales = mxfp4_marlin_process_scales(
+                        marlin_scales, input_dtype=input_dtype
+                    )
+                tensor_list.append(marlin_scales)
+
+            scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            scales = torch.nn.Parameter(scales, requires_grad=False)
+            setattr(layer, name + "_weight_scale", scales)
+            setattr(buffer, f"{base}_weight_scale", scales)
+
+            if is_nvfp4:
+                global_scale = nvfp4_marlin_process_global_scale(global_scale)
+                global_scale = torch.nn.Parameter(global_scale, requires_grad=False)
+                setattr(layer, name + "_weight_scale_2", global_scale)
+
+    # BIAS
+    # Permute bias for ping/pong buffers
+    for prefix in ["expert_cache_ping", "expert_cache_pong"]:
+        buffer = layer.expert_cache.ping_buffer if "ping" in prefix else layer.expert_cache.pong_buffer
+        for base in ["w13_bias", "w2_bias"]:
+            name = f"{prefix}_{base}"
+            if not hasattr(layer, name):
+                continue
+            bias = getattr(layer, name).to(param_dtype)
+
+            tensor_list = []
+            for i in range(e_cache):
+                expert_bias = bias[i]
+
+                tensor_list.append(marlin_permute_bias(expert_bias))
+
+            bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            bias = torch.nn.Parameter(bias, requires_grad=False)
+            setattr(layer, name, bias)
+            setattr(buffer, base, bias)
+    
     # Repack weights to marlin format
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
@@ -333,7 +435,6 @@ def prepare_moe_fp4_layer_for_marlin(
         bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
         bias = torch.nn.Parameter(bias, requires_grad=False)
         setattr(layer, name, bias)
-
 
 def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1

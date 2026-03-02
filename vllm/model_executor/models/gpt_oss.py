@@ -41,6 +41,7 @@ from vllm.utils.math_utils import cdiv
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -57,6 +58,7 @@ import time
 import torch
 from pathlib import Path
 
+logger = init_logger(__name__)
 TIMING_LOG_PATH = Path(f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/timing/{envs.LOG_SUFFIX}.csv")
 
 def log_header_if_needed():
@@ -264,13 +266,48 @@ class TransformerBlock(torch.nn.Module):
             if is_cuda:
                 torch.cuda.synchronize(device)
             t0 = time.perf_counter()
-        hidden_states = self.attn(hidden_states, positions)
+        with torch.profiler.record_function("attention"):
+            hidden_states = self.attn(hidden_states, positions)
         if envs.ENABLE_LATENCY_PROFILE:
             if is_cuda:
                 torch.cuda.synchronize(device)
             t1 = time.perf_counter()
             attn_input_shape = hidden_states.shape
             attn_ms = (t1 - t0) * 1000.0
+
+        # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
+        # predictor runs on CPU -> transfer hidden_states back to CPU for computation
+        # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
+        # Then we copy this tensor to next layer's cache. How do we access next layer's cache here?
+        next_layer = getattr(self, "next_layer", None)
+        if next_layer is not None and hidden_states.is_cuda:
+            prefetch_stream = getattr(self, "_prefetch_stream", None)
+            if prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream()
+                prefetch_stream = self._prefetch_stream
+
+            # 1) D2H copy on prefetch stream
+            with torch.cuda.stream(prefetch_stream):
+                hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
+            prefetch_stream.synchronize() # ensure d2h done before CPU prediction
+
+            # 2) TODO(ducct): implement CPU expert predictor
+            # predicted_ids = expert_predictor(hs_cpu) # CPU
+            predicted_ids = torch.tensor([0,4,2,9], device="cpu")
+
+            # 3) H2D prefetch on prefetch stream
+            moe = next_layer.mlp.experts
+            def do_prefetch():
+                inactive_bf = moe.expert_cache.get_inactive_buffer()
+                inactive_bf.fetch_on_demand(moe, predicted_ids)
+                print(f"active_buffer in trans block: {moe.expert_cache.active_buffer}")
+                if moe.expert_cache.active_buffer == "ping":
+                    moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
+                else:
+                    moe.cached_expert_ids_ping = predicted_ids.detach().to("cuda")
+
+            with torch.cuda.stream(prefetch_stream):
+                moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -281,7 +318,8 @@ class TransformerBlock(torch.nn.Module):
                 torch.cuda.synchronize(device)
             t2 = time.perf_counter()
             mlp_input_shape = hidden_states.shape
-        output = self.mlp(hidden_states)
+        with torch.profiler.record_function("moe"):
+            output = self.mlp(hidden_states)
         if envs.ENABLE_LATENCY_PROFILE:
             if is_cuda:
                 torch.cuda.synchronize(device)
@@ -319,6 +357,19 @@ class GptOssModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # NOTE(ducct): Link neighboring layers without registering as submodules.
+        for i, layer in enumerate(self.layers):
+            print("=== MoE weight device placement ===")
+            print(f"w13_weight: {layer.mlp.experts.w13_weight.device} - {layer.mlp.experts.w13_weight.shape}")
+            print(f"w13_weight_scale: {layer.mlp.experts.w13_weight_scale.device} - {layer.mlp.experts.w13_weight_scale.shape}")
+            print(f"w13_bias: {layer.mlp.experts.w13_bias.device} - {layer.mlp.experts.w13_bias.shape}")
+            print(f"w2_weight: {layer.mlp.experts.w2_weight.device} - {layer.mlp.experts.w2_weight.shape}")
+            print(f"w2_weight_scale: {layer.mlp.experts.w2_weight_scale.device} - {layer.mlp.experts.w2_weight_scale.shape}")
+            print(f"w2_bias: {layer.mlp.experts.w2_bias.device} - {layer.mlp.experts.w2_bias.shape}")
+            if isinstance(layer, PPMissingLayer):
+                continue
+            next_layer = self.layers[i + 1] if i + 1 < len(self.layers) else None
+            layer.__dict__["next_layer"] = next_layer
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
@@ -352,12 +403,18 @@ class GptOssModel(nn.Module):
             # NOTE(ducct)
             if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
                 envs.LAYER_ID = i
+            envs.LAYER_ID = i
 
             layer = self.layers[i]
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
-
-            x, residual = layer(x, positions, residual)
+            
+            # NOTE(ducct)
+            with torch.profiler.record_function("layer"):
+                x, residual = layer(x, positions, residual)
+                # TODO(ducct): add prefetching here only if you want to start prefetching at the start of layer
+                # prefetching_layer = self.layers[i + prefetching_distance]
+                # prefetching_layer.expert_cache.prefetch()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
@@ -376,12 +433,16 @@ class GptOssModel(nn.Module):
         weights: Iterable[tuple[str, torch.Tensor]],
         stacked_params_mapping: list[tuple[str, ...]],
     ) -> set[str]:
-        params_dict = dict(self.named_parameters())
+        # Include duplicate parameter names so shared expert cache params
+        # are visible for all layers.
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
 
         mxfp4_block = 32
         use_ep = self.parallel_config.enable_expert_parallel
         num_experts = self.config.num_local_experts
+        # NOTE(ducct): add num_global_experts
+        global_selected_expert_ids = list(range(num_experts))
 
         # In MoE, we need to flatten the tensor parallel size across the data
         # parallel size when EP is disabled.
@@ -411,11 +472,16 @@ class GptOssModel(nn.Module):
                 # Handle MLP gate and up projection weights scale
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
                 weight_loader(
                     param,
                     narrow_weight,
@@ -423,16 +489,57 @@ class GptOssModel(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                if "layers.0." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_ping_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+                    loaded_params.add(name)
+                elif "layers.1." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_pong_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    # NUM_CACHED_EXPERTS = 16
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+
                 loaded_params.add(name)
                 continue
             elif ".w2_weight_scale" in name:
                 # Handle MLP down projection weights
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
                     narrow_weight = weight[
                         ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
                     ]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -443,6 +550,43 @@ class GptOssModel(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                if "layers.0." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_ping_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+                    loaded_params.add(name)
+                elif "layers.1." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_pong_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    # NUM_CACHED_EXPERTS = 16
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+
                 loaded_params.add(name)
                 continue
             elif ".w13_weight" in name:
@@ -457,11 +601,16 @@ class GptOssModel(nn.Module):
                 # since the weight is shuffled, we can slice directly
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
                 weight_loader(
                     param,
                     narrow_weight,
@@ -469,7 +618,44 @@ class GptOssModel(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(name)
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                if "layers.0." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_ping_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+                    loaded_params.add(name)
+                elif "layers.1." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_pong_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    # NUM_CACHED_EXPERTS = 16
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+
+                    loaded_params.add(name)
                 continue
             elif ".w2_weight" in name:
                 # Handle MLP down projection weights
@@ -480,8 +666,12 @@ class GptOssModel(nn.Module):
                 ).contiguous()
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
                     narrow_weight = weight[..., tp_rank_start // 2 : tp_rank_end // 2]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -492,6 +682,42 @@ class GptOssModel(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                if "layers.0." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_ping_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+                    loaded_params.add(name)
+                elif "layers.1." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_pong_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+
                 loaded_params.add(name)
                 continue
             elif ".w13_bias" in name:
@@ -499,8 +725,12 @@ class GptOssModel(nn.Module):
                 # Extract gate and up projection bias parts
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -511,6 +741,42 @@ class GptOssModel(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                if "layers.0." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_ping_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+                    loaded_params.add(name)
+                elif "layers.1." in name:
+
+                    base, leaf = name.rsplit(".", 1)
+                    key = f"{base}.expert_cache_pong_{leaf}"
+                    cached_param = params_dict[key]
+                    cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                    cached_weight_loader(
+                        cached_param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                        selected_expert_ids=local_selected_expert_ids,
+                        key=key,
+                    )
+
+
                 loaded_params.add(name)
                 continue
             elif ".w2_bias" in name:
@@ -519,13 +785,53 @@ class GptOssModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if use_ep:
                     weight = weight[ep_rank_start:ep_rank_end, ...]
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids[ep_rank_start:ep_rank_end]
                 else:
+                    # NOTE(ducct):
+                    local_selected_expert_ids = global_selected_expert_ids
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
                         weight.zero_()
                 weight_loader(
                     param, weight, weight_name=name, shard_id=None, expert_id=None
                 )
+                # NOTE(ducct): pre-load layer 1 & 2's expert weights into the cache
+                # This means that we should check the name of the weight if it contains "layer_1" or "layer_2". If true, we perform preloading to expert cache.
+                # if "layers.0." in name:
+
+                #     base, leaf = name.rsplit(".", 1)
+                #     key = f"{base}.expert_cache_ping_{leaf}"
+                #     cached_param = params_dict[key]
+                #     cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                #     cached_weight_loader(
+                #         cached_param,
+                #         narrow_weight,
+                #         weight_name=name,
+                #         shard_id=None,
+                #         expert_id=None,
+                #         selected_expert_ids=local_selected_expert_ids,
+                #         key=key,
+                #     )
+
+                #     loaded_params.add(name)
+                # elif "layers.1." in name:
+
+                #     base, leaf = name.rsplit(".", 1)
+                #     key = f"{base}.expert_cache_pong_{leaf}"
+                #     cached_param = params_dict[key]
+                #     cached_weight_loader = getattr(param, "cached_weight_loader", default_weight_loader)
+                #     cached_weight_loader(
+                #         cached_param,
+                #         narrow_weight,
+                #         weight_name=name,
+                #         shard_id=None,
+                #         expert_id=None,
+                #         selected_expert_ids=local_selected_expert_ids,
+                #         key=key,
+                #     )
+
+
                 loaded_params.add(name)
                 continue
             elif "sinks" in name:
@@ -781,7 +1087,8 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        with torch.profiler.record_function("model"):
+            out = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         return out
 

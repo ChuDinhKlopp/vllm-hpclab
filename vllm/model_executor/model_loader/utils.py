@@ -75,6 +75,9 @@ def initialize_model(
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
     with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
+        # NOTE(ducct):
+        logger.info("Initialize model")
+
         return model_class(**kwargs)
 
 

@@ -3484,6 +3484,7 @@ class GPUModelRunner(
         with DeviceMemoryProfiler() as m:
             time_before_load = time.perf_counter()
             model_loader = get_model_loader(self.load_config)
+            print(f"model loader: {model_loader}")
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )

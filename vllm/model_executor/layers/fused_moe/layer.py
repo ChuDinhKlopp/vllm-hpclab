@@ -93,6 +93,234 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
+class ExpertBuffer:
+    w13_weight: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w13_bias: torch.Tensor
+    w2_weight: torch.Tensor
+    w2_weight_scale: torch.Tensor
+    w2_bias: torch.Tensor
+
+    def __init__(self, num_experts: int):
+        self.num_experts = num_experts
+        # Keep cached expert IDs on GPU when available to avoid CPU<->GPU hops.
+        device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        self.cached_expert_ids: torch.Tensor = torch.empty(
+            0, dtype=torch.int32, device=device
+        )
+        self.avail = True
+        self.prefetch_event: torch.cuda.Event | None = None
+
+    def record_expert_ids(self, expert_ids: torch.Tensor):
+        self.cached_expert_ids = expert_ids
+
+    def get_cached_expert_ids(self):
+        return self.cached_expert_ids
+
+    def is_avail(self):
+        return self.avail
+
+    def create_buffer(
+        self,
+        intermediate_size_per_partition_after_pad: int,
+        hidden_size: int,
+        mxfp4_block: int,
+        weight_dtype: torch.dtype,
+        scale_dtype: torch.dtype,
+    ):
+        self.w13_weight: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                2 * intermediate_size_per_partition_after_pad,
+                hidden_size // 2,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        self.w13_weight_scale: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                2 * intermediate_size_per_partition_after_pad,
+                hidden_size // mxfp4_block,
+                dtype=scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        self.w13_bias: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                2 * intermediate_size_per_partition_after_pad,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        self.w2_weight: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                hidden_size,
+                intermediate_size_per_partition_after_pad // 2,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        # w2 scale
+        self.w2_weight_scale: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                hidden_size,
+                intermediate_size_per_partition_after_pad // mxfp4_block,
+                dtype=scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        # w2 bias
+        self.w2_bias: torch.Tensor = torch.nn.Parameter(
+            torch.zeros(
+                self.num_experts,  # NOTE(ducct): expert cache size
+                hidden_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+
+    def _copy_float8_rows(self, dst, src, expert_ids, n):
+        # dst: GPU float8 tensor, src: CPU float8 tensor
+        dst_u8 = dst[:n].view(torch.uint8)
+        src_u8 = src.view(torch.uint8)[expert_ids]
+        dst_u8.copy_(src_u8)
+
+    def fetch_on_demand(self, layer, expert_ids):
+        expert_ids = expert_ids.reshape(-1)
+        if expert_ids.numel() == 0:
+            return
+
+        # Map global expert ids -> local expert ids when EP is enabled.
+        # Filter out experts not owned by this rank (mapped to -1).
+        if getattr(layer, "expert_map", None) is not None:
+            map_device = layer.expert_map.device
+            local_ids = layer.expert_map[
+                expert_ids.to(map_device, dtype=torch.long)
+            ]
+            keep = local_ids >= 0
+            if not torch.any(keep):
+                return
+            local_ids = local_ids[keep]
+        else:
+            local_ids = expert_ids
+
+        local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
+        num_expert_ids = local_ids.numel()
+        print(f"num_expert_ids: {num_expert_ids}")
+
+        self.w13_weight[:num_expert_ids].copy_(layer.w13_weight[local_ids])
+        self.w13_bias[:num_expert_ids].copy_(layer.w13_bias[local_ids])
+        self.w2_weight[:num_expert_ids].copy_(layer.w2_weight[local_ids])
+        self.w2_bias[:num_expert_ids].copy_(layer.w2_bias[local_ids])
+
+        # float8 scales: index via uint8 view
+        self._copy_float8_rows(
+            self.w13_weight_scale,
+            layer.w13_weight_scale,
+            local_ids,
+            num_expert_ids,
+        )
+        self._copy_float8_rows(
+            self.w2_weight_scale,
+            layer.w2_weight_scale,
+            local_ids,
+            num_expert_ids,
+        )
+
+
+class ExpertCache:
+    ping_buffer = None
+    pong_buffer = None
+    active_buffer = "ping"
+
+    @classmethod
+    def init_buffers(cls, num_experts):
+        if cls.ping_buffer is not None and cls.pong_buffer is not None:
+            return cls
+        cls.ping_buffer = ExpertBuffer(num_experts=num_experts)
+        cls.pong_buffer = ExpertBuffer(num_experts=num_experts)
+        cls.active_buffer = "ping"
+        return cls
+
+    @classmethod
+    def create_cache(
+        cls,
+        intermediate_size_per_partition_after_pad,
+        hidden_size,
+        mxfp4_block,
+        weight_dtype,
+        scale_dtype,
+    ):
+        # Avoid reallocating shared buffers if they already exist.
+        if (
+            cls.ping_buffer is not None
+            and cls.pong_buffer is not None
+            and getattr(cls.ping_buffer, "w13_weight", None) is not None
+            and getattr(cls.pong_buffer, "w13_weight", None) is not None
+        ):
+            return
+        cls.ping_buffer.create_buffer(
+            intermediate_size_per_partition_after_pad,
+            hidden_size,
+            mxfp4_block,
+            weight_dtype,
+            scale_dtype,
+        )
+        cls.pong_buffer.create_buffer(
+            intermediate_size_per_partition_after_pad,
+            hidden_size,
+            mxfp4_block,
+            weight_dtype,
+            scale_dtype,
+        )
+
+    @classmethod
+    def get_active_buffer(cls):
+        if cls.active_buffer == "ping":
+            return cls.ping_buffer
+        return cls.pong_buffer
+
+    @classmethod
+    def get_inactive_buffer(cls):
+        if cls.active_buffer == "ping":
+            return cls.pong_buffer
+        return cls.ping_buffer
+
+    @classmethod
+    def flip_active_buffer(cls):
+        cls.active_buffer = "pong" if cls.active_buffer == "ping" else "ping"
+
+    @classmethod
+    def prefetch(
+        cls,
+        predicted_expert_ids,
+        prefetch_fn: Callable[[], None] | None = None,
+        stream: torch.cuda.Stream | None = None,
+    ):
+        # NOTE(ducct): mark inactive buffer unavailable and record completion event.
+        inactive_cache = cls.get_inactive_buffer()
+        inactive_cache.avail = False
+        if torch.cuda.is_available():
+            if stream is None:
+                stream = torch.cuda.current_stream()
+            with torch.cuda.stream(stream):
+                if prefetch_fn is not None:
+                    prefetch_fn()
+                inactive_cache.prefetch_event = torch.cuda.Event()
+                inactive_cache.prefetch_event.record(stream)
+        else:
+            if prefetch_fn is not None:
+                prefetch_fn()
+            inactive_cache.avail = True
+
 logger = init_logger(__name__)
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -639,6 +867,8 @@ class FusedMoE(CustomOp):
             "params_dtype": params_dtype,
             "weight_loader": self.weight_loader,
             "global_num_experts": self.global_num_experts,
+            # NOTE(ducct): add cached_weight_loader
+            "cached_weight_loader": self.cached_weight_loader,
         }
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in (
@@ -647,6 +877,16 @@ class FusedMoE(CustomOp):
             "CompressedTensorsWNA16MoEMethod",
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
+
+        # NOTE(ducct): shared ping-pong cache across all layers
+        self.expert_cache = ExpertCache.init_buffers(
+            num_experts=self.global_num_experts
+        )
+        # NOTE(ducct): per-layer cached expert ids for ping/pong buffers
+        self.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32)
+        print(f"self.cached_expert_ids_ping.device: {self.cached_expert_ids_ping.device}")
+        self.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32)
+        print(f"self.cached_expert_ids_pong.device: {self.cached_expert_ids_pong.device}")
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
@@ -1306,6 +1546,171 @@ class FusedMoE(CustomOp):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
+            quant_method = getattr(param, "quant_method", None)
+            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+            elif quant_method in [
+                FusedMoeWeightScaleSupported.GROUP.value,
+                FusedMoeWeightScaleSupported.BLOCK.value,
+            ]:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full_w2=getattr(param, "load_full_w2", False),
+                )
+            elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=expert_id,
+                )
+            else:
+                WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
+                raise ValueError(
+                    f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}"
+                )
+            return True if return_success else None
+
+        # Case weight_shape
+        if "weight_shape" in weight_name:
+            # only required by compressed-tensors
+            self._load_single_value(
+                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+            )
+            return True if return_success else None
+
+        # Case model weights
+        if "weight" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True if return_success else None
+
+        return False if return_success else None
+
+    # NOTE(ducct): custom weight loader for expert cache
+    def cached_weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        selected_expert_ids: list[int],
+        key: str,
+        return_success: bool = False,
+    ) -> bool | None:
+        if self.quant_config and self.quant_config.get_name() == "mxfp4":
+            # (FIXME) for gpt-oss all experts are combined
+            if "bias" in weight_name:
+                if "ping" in key:
+                    self.cached_expert_ids_ping = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                elif "pong" in key:
+                    self.cached_expert_ids_pong = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                lw = loaded_weight
+                if lw.dim() == 1:
+                    lw = lw.unsqueeze(0)
+                dim1 = lw.shape[1]
+                param.data[: lw.shape[0], :dim1].copy_(lw)
+            else:
+                if "ping" in key:
+                    self.cached_expert_ids_ping = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                elif "pong" in key:
+                    self.cached_expert_ids_pong = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                lw = loaded_weight
+                if lw.dim() == 2:
+                    lw = lw.unsqueeze(0)
+                dim1 = lw.shape[1]
+                dim2 = lw.shape[2]
+                param.data[: lw.shape[0], :dim1, :dim2].copy_(lw)
+            return True if return_success else None
+
+        quant_method_name = self.quant_method.__class__.__name__
+        global_expert_id = expert_id
+        expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
+
+        allow_flashinfer = getattr(self.quant_method, "allow_flashinfer", False)
+        moe_backend = getattr(self.quant_method, "flashinfer_moe_backend", None)
+
+        use_global_sf = (
+            allow_flashinfer
+            and is_flashinfer_supporting_global_sf(moe_backend)
+            and "input_scale" in weight_name
+            and quant_method_name == "ModelOptNvFp4FusedMoE"
+        )
+
+        if expert_id == -1 and not use_global_sf:
+            # Failed to load this param since it's not local to this rank
+            return False if return_success else None
+        # Hereafter, `expert_id` is local physical id
+
+        # compressed-tensors checkpoints with packed weights are stored flipped
+        # TODO (mgoin): check self.quant_method.quant_config.quant_format
+        # against known CompressionFormat enum values that have this quality
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+
+        # Fetch the dim to shard the parameter/loaded weight
+        # based on the shard id. This will be whatever
+        # dimension intermediate_size_per_partition is used.
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+            param.data.copy_(loaded_weight)
+            return True if return_success else None
+
+        # Return a view of the weight based on expert
+        expert_data = (
+            loaded_weight
+            if is_gguf_weight
+            else loaded_weight[expert_id]
+            if not use_global_sf
+            else loaded_weight[global_expert_id]
+        )
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+        # Case weight scales, zero_points and offset, weight/input global scales
+        if (
+            "input_scale" in weight_name
+            or "weight_scale" in weight_name
+            or "scale" in weight_name
+            or "zero" in weight_name
+            or "offset" in weight_name
+        ):
+            # load the weight scales and zp based on the quantization scheme
+            # supported weight scales/zp can be found in
+            # FusedMoeWeightScaleSupported
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 self._load_per_channel_weight_scale(
