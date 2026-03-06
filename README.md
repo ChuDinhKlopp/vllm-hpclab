@@ -1,5 +1,5 @@
 ## About
-This fork implements **expert-granularity offloading** and **partial experts prefetching** for vLLM.
+This fork implements **expert-granularity offloading** and **partial experts prefetching** for vLLM. For **expert predictor** testing, refer to `gpt_oss.py`, where the logic is implemented and used.
 
 ## Supported Models
 This repository currently supports the following **GPT-OSS** models:
@@ -25,7 +25,7 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install --editable .
 ```
 
-### Run the project
+## Run the project
 Use vllm serve with the local model path and --enforce-eager:
 ```bash
 vllm serve /path/to/gpt-oss-120b --enforce-eager
