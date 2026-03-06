@@ -318,20 +318,39 @@ class ExpertBuffer(nn.Module):
                     device=layer.w13_weight.device,
                     dtype=torch.long,
                 )
-            self.w13_weight[slot_ids].copy_(layer.w13_weight[local_ids])
-            self.w13_bias[slot_ids].copy_(layer.w13_bias[local_ids])
-            self.w2_weight[slot_ids].copy_(layer.w2_weight[local_ids])
-            self.w2_bias[slot_ids].copy_(layer.w2_bias[local_ids])
+            # self.w13_weight[slot_ids].copy_(layer.w13_weight[local_ids])
+            # self.w13_bias[slot_ids].copy_(layer.w13_bias[local_ids])
+            # self.w2_weight[slot_ids].copy_(layer.w2_weight[local_ids])
+            # self.w2_bias[slot_ids].copy_(layer.w2_bias[local_ids])
+
+            self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
+            self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
+            self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
+            self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
+            # OLD: assignment-based row update.
+            # self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
+            # self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
+            # self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
+            # self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
+            # NEW: use index_copy_ to guarantee in-place writes on destination.
+            # self.w13_weight.index_copy_(0, slot_ids, layer.w13_weight.index_select(0, local_ids))
+            # self.w13_bias.index_copy_(0, slot_ids, layer.w13_bias.index_select(0, local_ids))
+            # self.w2_weight.index_copy_(0, slot_ids, layer.w2_weight.index_select(0, local_ids))
+            # self.w2_bias.index_copy_(0, slot_ids, layer.w2_bias.index_select(0, local_ids))
 
             # float8 scales: index via uint8 view
             # Use explicit slot_ids so cache rows align with cached_expert_ids.
             dst_u8 = self.w13_weight_scale.view(torch.uint8)
             src_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-            dst_u8[slot_ids].copy_(src_u8)
+            dst_u8[slot_ids] = src_u8.to("cuda")
+            # OLD: dst_u8[slot_ids].copy_(src_u8)
+            # dst_u8.index_copy_(0, slot_ids, src_u8)
 
             dst_u8 = self.w2_weight_scale.view(torch.uint8)
             src_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-            dst_u8[slot_ids].copy_(src_u8)
+            dst_u8[slot_ids] = src_u8.to("cuda")
+            # OLD: dst_u8[slot_ids].copy_(src_u8)
+            # dst_u8.index_copy_(0, slot_ids, src_u8)
 
 
 class ExpertCache(nn.Module):
@@ -904,12 +923,12 @@ class TransformerBlock(torch.nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         # NOTE(ducct): add expert predictor
-        # self.expert_predictor = ExpertPredictor(
-        #     weight_path="/home/ducct/repos/profiling/trace-analysis/vllm-offload/epoch=01-val_acc=0.9493.ckpt",
-        #     input_dim=2880,
-        #     num_experts=config.num_local_experts,
-        #     device="cpu",
-        # )
+        self.expert_predictor = ExpertPredictor(
+            weight_path="/home/ducct/repos/profiling/trace-analysis/vllm-offload/epoch=01-val_acc=0.9493.ckpt",
+            input_dim=2880,
+            num_experts=config.num_local_experts,
+            device="cpu",
+        )
         self.top_k = self.mlp.experts.top_k
 
 
@@ -946,10 +965,10 @@ class TransformerBlock(torch.nn.Module):
             # 2) NOTE(ducct): implement CPU expert predictor
             moe = next_layer.mlp.experts
             with torch.profiler.record_function("expert_predictor"):
-                #predicted_ids = self.expert_predictor.predict_batch(
-                #    hs_cpu, top_k=self.top_k
-                #)["indices"]  # CPU
-                predicted_ids = torch.tensor([0,4,2,9], device="cpu")
+                predicted_ids = self.expert_predictor.predict_batch(
+                    hs_cpu, top_k=self.top_k
+                )["indices"]  # CPU
+                # predicted_ids = torch.tensor([0,4,2,9], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
             with torch.profiler.record_function("expert_ids.check_and_normalize"):
@@ -1040,6 +1059,9 @@ class GptOssModel(nn.Module):
             ["hidden_states", "residual"], self.config.hidden_size
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
+        # NOTE(ducct): 
+        self._hidden_state_step = 0
+
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)

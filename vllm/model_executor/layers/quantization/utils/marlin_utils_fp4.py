@@ -305,7 +305,7 @@ def prepare_moe_fp4_cache_for_marlin(
 
             scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
             scales = torch.nn.Parameter(scales, requires_grad=False)
-            setattr(layer, base + "_weight_scale", scales)
+            # setattr(layer, base + "_weight_scale", scales)
             setattr(buffer, f"{base}_weight_scale", scales)
 
             if is_nvfp4:
@@ -323,9 +323,12 @@ def prepare_moe_fp4_cache_for_marlin(
         )
         for base in ["w13_bias", "w2_bias"]:
             name = f"{prefix}_{base}"
-            if not hasattr(buffer, name):
+            # OLD: if not hasattr(buffer, name):
+            # buffer stores plain names (w13_bias / w2_bias), not prefixed names.
+            if not hasattr(buffer, base):
                 continue
-            bias = getattr(buffer, name).to(param_dtype)
+            # OLD: bias = getattr(buffer, name).to(param_dtype)
+            bias = getattr(buffer, base).to(param_dtype)
 
             tensor_list = []
             for i in range(e_cache):
@@ -335,7 +338,9 @@ def prepare_moe_fp4_cache_for_marlin(
 
             bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
             bias = torch.nn.Parameter(bias, requires_grad=False)
-            setattr(layer, name, bias)
+            # OLD: setattr(layer, name, bias)
+            # The registered cache params live on layer.expert_cache.
+            # setattr(layer.expert_cache, name, bias)
             setattr(buffer, base, bias)
 
 

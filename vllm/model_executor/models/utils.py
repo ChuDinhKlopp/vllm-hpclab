@@ -687,7 +687,7 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [
-            # maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+            # maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")) # NOTE(ducct)
             my_offload(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
         ]
