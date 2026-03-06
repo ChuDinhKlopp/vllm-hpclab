@@ -24,7 +24,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -52,7 +51,7 @@ class InternVisionEmbeddings(nn.Module):
 
         self.class_embedding = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
-        self.patch_embedding = Conv2dLayer(
+        self.patch_embedding = nn.Conv2d(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

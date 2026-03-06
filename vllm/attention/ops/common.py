@@ -21,7 +21,6 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
-    IS_BASE_E: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -56,14 +55,9 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
     lse -= lse_max
-    if IS_BASE_E:
-        lse_exp = tl.exp(lse)
-        lse_acc = tl.sum(lse_exp, axis=0)
-        lse = tl.log(lse_acc)
-    else:
-        lse_exp = tl.exp2(lse)
-        lse_acc = tl.sum(lse_exp, axis=0)
-        lse = tl.log2(lse_acc)
+    lse_exp = tl.exp(lse)
+    lse_acc = tl.sum(lse_exp, axis=0)
+    lse = tl.log(lse_acc)
     lse += lse_max
 
     lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -87,7 +81,7 @@ def _correct_attn_cp_out_kernel(
         -float("inf"),
         lse_finally,
     )
-    factor = tl.exp(lse_finally) if IS_BASE_E else tl.exp2(lse_finally)
+    factor = tl.exp(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
@@ -108,11 +102,7 @@ class CPTritonContext:
 
 
 def correct_attn_out(
-    out: torch.Tensor,
-    lses: torch.Tensor,
-    cp_rank: int,
-    ctx: CPTritonContext,
-    is_lse_base_on_e: bool = True,
+    out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -173,17 +163,18 @@ def correct_attn_out(
         l_sH,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
 
 
-def _cp_lse_common(
+def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
-    ctx: CPTritonContext | None = None,
-    is_lse_base_on_e=True,
+    ctx: CPTritonContext = None,
+    return_lse=False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -203,59 +194,13 @@ def _cp_lse_common(
 
     cp_attn_lse = cp_attn_lse.contiguous()
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view_as(lses)
-    out, lse = correct_attn_out(
-        cp_attn_out,
-        lses,
-        cp_group.rank_in_group,
-        ctx,
-        is_lse_base_on_e=is_lse_base_on_e,
-    )
-    return out, lse
-
-
-def cp_lse_ag_out_rs(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: GroupCoordinator,
-    ctx: CPTritonContext | None = None,
-    return_lse: bool = False,
-    is_lse_base_on_e=True,
-):
-    """
-    cp_attn_out: [ B, H, D ]
-    cp_attn_lse: [ B, H ]
-    """
-    out, lse = _cp_lse_common(
-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
-    )
+    out, lse = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
     out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size
         cp_rank = cp_group.rank_in_group
         lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)]
-        return out, lse
-    return out
-
-
-def cp_lse_ag_out_ar(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: GroupCoordinator,
-    ctx: CPTritonContext | None = None,
-    return_lse: bool = False,
-    is_lse_base_on_e=True,
-):
-    """
-    cp_attn_out: [ B, H, D ]
-    cp_attn_lse: [ B, H ]
-    """
-    out, lse = _cp_lse_common(
-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
-    )
-    out = cp_group.all_reduce(out)
-
-    if return_lse:
         return out, lse
     return out
 

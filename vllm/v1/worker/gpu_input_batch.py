@@ -43,8 +43,6 @@ class CachedRequestState:
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: int | None = None
 
-    xdrope_positions: torch.Tensor | None = None
-
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
 
@@ -89,7 +87,7 @@ class InputBatch:
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
-        cp_kv_cache_interleave_size: int = 1,
+        dcp_kv_cache_interleave_size: int = 1,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -143,7 +141,7 @@ class InputBatch:
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             num_speculative_tokens=num_speculative_tokens,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            dcp_kv_cache_interleave_size=dcp_kv_cache_interleave_size,
         )
 
         # Sampling-related.
@@ -221,6 +219,9 @@ class InputBatch:
         self.generators: dict[int, torch.Generator] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        # NOTE(rob): num_prompt_logprobs only includes reqs
+        # that are currently in the prefill phase.
+        self.num_prompt_logprobs: dict[str, int] = {}
 
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
@@ -250,7 +251,7 @@ class InputBatch:
         self.logitsprocs_need_output_token_ids = logitsprocs_need_output_token_ids
 
         # Store last speculative tokens for sampler.
-        self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
+        self.spec_token_ids: list[list[int] | None] = []
 
         # This is updated each time the batch constituents change.
         self.sampling_metadata = self._make_sampling_metadata()
@@ -264,7 +265,7 @@ class InputBatch:
         # ids from prior step, if required by current sampling params
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
-        self.async_copy_ready_event: torch.Event | None = None
+        self.async_copy_ready_event: torch.cuda.Event | None = None
 
     @property
     def req_ids(self) -> list[str]:
@@ -312,7 +313,7 @@ class InputBatch:
         else:
             self._req_ids[req_index] = req_id
             self.req_output_token_ids[req_index] = request.output_token_ids
-            self.spec_token_ids[req_index].clear()
+            self.spec_token_ids[req_index] = []
 
         self.req_id_to_index[req_id] = req_index
 
@@ -383,6 +384,12 @@ class InputBatch:
                     self.vocab_size
                     if sampling_params.logprobs == -1
                     else sampling_params.logprobs
+                )
+            if sampling_params.prompt_logprobs is not None:
+                self.num_prompt_logprobs[req_id] = (
+                    self.vocab_size
+                    if sampling_params.prompt_logprobs == -1
+                    else sampling_params.prompt_logprobs
                 )
 
             if sampling_params.allowed_token_ids:
@@ -455,7 +462,7 @@ class InputBatch:
         self.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
-        self.spec_token_ids[req_index].clear()
+        self.spec_token_ids[req_index] = None
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -481,9 +488,8 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.num_prompt_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
-        if self.prev_req_id_to_index is not None:
-            self.prev_req_id_to_index.pop(req_id, None)
 
         self.has_allowed_token_ids.discard(req_id)
         if self.allowed_token_ids_mask_cpu_tensor is not None:
@@ -529,7 +535,7 @@ class InputBatch:
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
         #     self.token_ids_cpu[i2, ...], self.token_ids_cpu[i1, ...]
-        # instead, we need to temporarily copy the data for one of the indices
+        # instead, we need to temporiarily copy the data for one of the indices
         # TODO(lucas): optimize this by only copying valid indices
         tmp = self.token_ids_cpu[i1, ...].copy()
         self.token_ids_cpu[i1, ...] = self.token_ids_cpu[i2, ...]
@@ -648,15 +654,9 @@ class InputBatch:
             self.req_output_token_ids[last_req_index] = None
             self.req_id_to_index[req_id] = empty_index
 
-            if last_req_index != empty_index:
-                (
-                    self.spec_token_ids[last_req_index],
-                    self.spec_token_ids[empty_index],
-                ) = (
-                    self.spec_token_ids[empty_index],
-                    self.spec_token_ids[last_req_index],
-                )
-                self.spec_token_ids[last_req_index].clear()
+            spec_token_ids = self.spec_token_ids[last_req_index]
+            self.spec_token_ids[empty_index] = spec_token_ids
+            self.spec_token_ids[last_req_index] = None
 
             num_tokens = self.num_tokens[last_req_index]
             self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
@@ -891,7 +891,7 @@ class InputBatch:
     def set_async_sampled_token_ids(
         self,
         sampled_token_ids_cpu: torch.Tensor,
-        async_copy_ready_event: torch.Event,
+        async_copy_ready_event: torch.cuda.Event,
     ) -> None:
         """
         In async scheduling case, store ref to sampled_token_ids_cpu
@@ -965,6 +965,10 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> int | None:
         return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    @property
+    def no_prompt_logprob(self) -> bool:
+        return not self.num_prompt_logprobs
 
     @property
     def no_allowed_token_ids(self) -> bool:

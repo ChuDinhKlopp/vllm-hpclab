@@ -721,12 +721,12 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
     """
 
     @staticmethod
-    def dummy(modality: str, nbytes: int = 1):
+    def dummy(modality: str):
         """Convenience class for testing."""
         mm_elem = MultiModalFieldElem(
             modality=modality,
             key="dummy",
-            data=torch.empty(nbytes, dtype=torch.uint8),
+            data=torch.empty(1),
             field=MultiModalSharedField(1),
         )
         return MultiModalKwargsItem.from_elems([mm_elem])

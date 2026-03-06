@@ -10,8 +10,6 @@ def is_ray_initialized():
         return ray.is_initialized()
     except ImportError:
         return False
-    except AttributeError:
-        return False
 
 
 def is_in_ray_actor():
@@ -25,6 +23,4 @@ def is_in_ray_actor():
             and ray.get_runtime_context().get_actor_id() is not None
         )
     except ImportError:
-        return False
-    except AttributeError:
         return False

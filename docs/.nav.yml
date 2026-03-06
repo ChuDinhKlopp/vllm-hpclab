@@ -5,7 +5,11 @@ nav:
     - Getting Started:
       - getting_started/quickstart.md
       - getting_started/installation
-      - Examples: examples
+    - Examples:
+      - examples/README.md
+      - Offline Inference: examples/offline_inference
+      - Online Serving: examples/online_serving
+      - Others: examples/others
     - General:
       - usage/v1_guide.md
       - usage/*
@@ -20,16 +24,14 @@ nav:
       - deployment/integrations
     - Training: training
     - Configuration:
+      - configuration/README.md
       - configuration/*
-      - TPU: https://docs.vllm.ai/projects/tpu/en/latest/
     - Models:
       - models/supported_models.md
       - models/generative_models.md
       - models/pooling_models.md
       - models/extensions
-      - Hardware Supported Models:
-        - models/hardware_supported_models/*
-        - TPU: https://docs.vllm.ai/projects/tpu/en/latest/recommended_models_features/
+      - Hardware Supported Models: models/hardware_supported_models
     - Features: features
   - Developer Guide:
     - contributing/README.md
@@ -48,11 +50,6 @@ nav:
       - Plugins:
         - design/*plugin*.md
       - design/*
-  - Benchmarking:
-      - benchmarking/README.md
-      - benchmarking/cli.md
-      - benchmarking/sweeps.md
-      - benchmarking/dashboard.md
   - API Reference:
     - api/README.md
     - api/vllm

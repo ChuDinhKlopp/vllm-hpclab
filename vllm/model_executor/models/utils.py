@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from transformers import PretrainedConfig
+from typing_extensions import deprecated
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -19,9 +20,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
-)
-from vllm.model_executor.model_loader.online_quantization import (
-    support_quantized_model_reload_from_hp_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import supports_any_eagle
@@ -318,7 +316,6 @@ class AutoWeightsLoader:
                 )
                 raise ValueError(msg)
 
-    @support_quantized_model_reload_from_hp_weights
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -480,6 +477,54 @@ def _merge_multimodal_embeddings(
     return inputs_embeds
 
 
+@deprecated(
+    "`merge_multimodal_embeddings` has been replaced with "
+    "`SupportsMultiModal.embed_input_ids` and will be "
+    "removed in v0.12."
+)
+def merge_multimodal_embeddings(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    multimodal_embeddings: NestedTensors,
+    placeholder_token_id: int | list[int],
+) -> torch.Tensor:
+    """
+    Merge `multimodal_embeddings` into `inputs_embeds` by overwriting the
+    positions in `inputs_embeds` corresponding to placeholder tokens in
+    `input_ids`.
+
+    `placeholder_token_id` can be a list of token ids (e.g, token ids
+    of img_start, img_break, and img_end tokens) when needed: This means
+    the order of these tokens in the `input_ids` MUST MATCH the order of
+    their embeddings in `multimodal_embeddings` since we need to
+    slice-merge instead of individually scattering.
+
+    For example, if input_ids is "TTTTTSIIIBIIIBIIIETTT", where
+    - T is text token
+    - S is image start token
+    - I is image embedding token
+    - B is image break token
+    - E is image end token.
+
+    Then the image embeddings (that correspond to I's) from vision encoder
+    must be padded with embeddings of S, B, and E in the same order of
+    input_ids for a correct embedding merge.
+
+    Note:
+        This updates `inputs_embeds` in place.
+    """
+    if isinstance(placeholder_token_id, list):
+        is_multimodal = isin_list(input_ids, placeholder_token_id)
+    else:
+        is_multimodal = input_ids == placeholder_token_id
+
+    return _merge_multimodal_embeddings(
+        inputs_embeds,
+        multimodal_embeddings=multimodal_embeddings,
+        is_multimodal=is_multimodal,
+    )
+
+
 def isin_list(
     elements: torch.Tensor,
     test_elements_list: list[int],
@@ -519,66 +564,16 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
 
 
-# NOTE(ducct): offload all non-cache tensors to CPU, keeping all cache tensors on GPU
-def my_offload(module: torch.nn.Module) -> torch.nn.Module:
-    # NOTE(ducct): if no param in the module, return
-    if (params := next(module.parameters(), None)) is None:
-        return module
-
-    device = params.device
-    
-    # NOTE(ducct): if the param is already on CPU, return
-    if device == torch.device("cpu"):
-        return module
-
-    # offload parameters to CPU
-    # use pin_memory if possible, which helps cudagraph capture speed
-    offloaded_parameters = False
-    offload_w = (
-        "mlp.experts.w13_weight",
-        "mlp.experts.w13_weight_scale",
-        "mlp.experts.w13_bias",
-        "mlp.experts.w2_weight",
-        "mlp.experts.w2_weight_scale",
-        "mlp.experts.w2_bias",
-    )
-    pin_memory = is_pin_memory_available()
-    for name, p in module.named_parameters():
-        if name.endswith(offload_w):
-            cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            cpu_data.copy_(p.data)
-            p.data = cpu_data
-
-    return module
-
-            
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    # NOTE(ducct):
-    for name, param in module.named_parameters():
-        print(name, tuple(param.shape))
-    # NOTE(ducct): if no param in the module, return
     if (params := next(module.parameters(), None)) is None:
         return module
 
     device = params.device
-    
-    # NOTE(ducct): if the param is already on CPU, return
+
     if device == torch.device("cpu"):
         return module
 
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-
-    # NOTE(ducct):
-    print(f"_CPU_OFFLOAD_BYTES: {_CPU_OFFLOAD_BYTES}")
-    print(f"_CPU_OFFLOAD_MAX_BYTES: {_CPU_OFFLOAD_MAX_BYTES}")
-
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
@@ -653,8 +648,7 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [
-            # maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")) # NOTE(ducct): layer_fn = TransformerBlock = MLP + Attn
-            my_offload(layer_fn(prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
         ]
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]

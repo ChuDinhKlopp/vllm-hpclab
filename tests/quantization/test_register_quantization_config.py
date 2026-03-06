@@ -23,8 +23,8 @@ from vllm.model_executor.layers.quantization import (
     get_quantization_config,
     register_quantization_config,
 )
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,  # noqa: E501
+from vllm.model_executor.layers.quantization.base_config import (  # noqa: E501
+    QuantizationConfig,
 )
 
 
@@ -142,5 +142,5 @@ def test_custom_quant(vllm_runner, model, monkeypatch):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=1)
+        output = llm.generate_greedy("Hello my name is", max_tokens=20)
         assert output

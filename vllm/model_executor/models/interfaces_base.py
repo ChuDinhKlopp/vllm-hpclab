@@ -19,14 +19,10 @@ from vllm.utils.func_utils import supports_kw
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.config.model import AttnTypeStr
-    from vllm.config.pooler import PoolingTypeStr
     from vllm.model_executor.layers.pooler import Pooler
 else:
     VllmConfig = Any
     Pooler = Any
-    PoolingTypeStr = Any
-    AttnTypeStr = Any
 
 logger = init_logger(__name__)
 
@@ -76,7 +72,6 @@ def _check_vllm_model_embed_input_ids(model: type[object] | object) -> bool:
                 "this method to `embed_input_ids`."
             )
             model.embed_input_ids = model_get_input_embeddings
-            return True
         logger.warning(
             "The model (%s) is missing the `embed_input_ids` method.",
             model,
@@ -170,24 +165,14 @@ class VllmModelForPooling(VllmModel[T_co], Protocol[T_co]):
         MRO of your model class.
     """
 
-    default_pooling_type: ClassVar[PoolingTypeStr] = "LAST"
+    default_pooling_type: ClassVar[str] = "LAST"
     """
-    Indicates the [vllm.config.pooler.PoolerConfig.pooling_type][]
+    Indicates the
+    [vllm.model_executor.layers.pooler.PoolerConfig.pooling_type][]
     to use by default.
 
     You can use the
     [vllm.model_executor.models.interfaces_base.default_pooling_type][]
-    decorator to conveniently set this field.
-    """
-
-    attn_type: ClassVar[AttnTypeStr] = "decoder"
-    """
-    Indicates the
-    [vllm.config.model.ModelConfig.attn_type][]
-    to use by default.
-
-    You can use the
-    [vllm.model_executor.models.interfaces_base.attn_type][]
     decorator to conveniently set this field.
     """
 
@@ -215,7 +200,7 @@ def is_pooling_model(
 _T = TypeVar("_T", bound=type[nn.Module])
 
 
-def default_pooling_type(pooling_type: PoolingTypeStr):
+def default_pooling_type(pooling_type: str):
     """Decorator to set `VllmModelForPooling.default_pooling_type`."""
 
     def func(model: _T) -> _T:
@@ -225,19 +210,5 @@ def default_pooling_type(pooling_type: PoolingTypeStr):
     return func
 
 
-def get_default_pooling_type(model: type[object] | object) -> PoolingTypeStr:
+def get_default_pooling_type(model: type[object] | object) -> str:
     return getattr(model, "default_pooling_type", "LAST")
-
-
-def attn_type(attn_type: AttnTypeStr):
-    """Decorator to set `VllmModelForPooling.attn_type`."""
-
-    def func(model: _T) -> _T:
-        model.attn_type = attn_type  # type: ignore
-        return model
-
-    return func
-
-
-def get_attn_type(model: type[object] | object) -> AttnTypeStr:
-    return getattr(model, "attn_type", "decoder")

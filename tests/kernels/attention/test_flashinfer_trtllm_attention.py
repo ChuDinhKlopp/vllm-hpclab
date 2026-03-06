@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import flashinfer
 import pytest
 import torch
 
@@ -15,8 +16,6 @@ if not current_platform.is_device_capability(100):
     pytest.skip(
         "This TRTLLM kernel requires NVIDIA Blackwell.", allow_module_level=True
     )
-else:
-    import flashinfer
 
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 FP8_DTYPE = current_platform.fp8_dtype()

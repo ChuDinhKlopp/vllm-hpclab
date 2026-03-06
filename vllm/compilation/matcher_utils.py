@@ -162,10 +162,12 @@ class MatcherRMSNorm(MatcherCustomOp):
         weight: torch.Tensor,
     ) -> torch.Tensor:
         result = torch.empty_like(input)
+        # TODO: support non-contiguous input for RMSNorm and remove this
+        input_contiguous = input.contiguous()
         _, result = auto_functionalized(
             RMS_OP,
             result=result,
-            input=input,
+            input=input_contiguous,
             weight=weight,
             epsilon=self.epsilon,
         )

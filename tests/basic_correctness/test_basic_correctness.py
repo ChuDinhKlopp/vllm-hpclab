@@ -74,6 +74,9 @@ def test_models(
     model_executor: str,
     enable_prompt_embeds: bool,
 ) -> None:
+    if backend == "XFORMERS" and model == "google/gemma-2-2b-it":
+        pytest.skip(f"{backend} does not support gemma2 with full context length.")
+
     with monkeypatch.context() as m:
         m.setenv("VLLM_ATTENTION_BACKEND", backend)
 

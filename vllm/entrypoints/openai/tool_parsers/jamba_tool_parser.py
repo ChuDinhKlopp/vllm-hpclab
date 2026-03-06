@@ -21,13 +21,14 @@ from vllm.entrypoints.openai.protocol import (
 from vllm.entrypoints.openai.tool_parsers import ToolParser
 from vllm.entrypoints.openai.tool_parsers.utils import extract_intermediate_diff
 from vllm.logger import init_logger
-from vllm.tokenizers import MistralTokenizer, TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.transformers_utils.tokenizers import MistralTokenizer
 
 logger = init_logger(__name__)
 
 
 class JambaToolParser(ToolParser):
-    def __init__(self, tokenizer: TokenizerLike):
+    def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
 
         if isinstance(self.model_tokenizer, MistralTokenizer):

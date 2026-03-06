@@ -87,7 +87,8 @@ class Mamba2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        output = self.mixer(hidden_states)
+        output = torch.empty_like(hidden_states)
+        self.mixer(hidden_states, output)
         return output, residual
 
 

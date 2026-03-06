@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.attention.layer import Attention
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -36,7 +36,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.step3_vl import Step3TextConfig
 
 from .interfaces import SupportsPP
 from .utils import (
@@ -145,8 +144,9 @@ class Step3TextAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         norm_eps: float,
-        rope_parameters: dict[str, Any],
+        rope_theta: int,
         share_q_dim: int | None = None,
+        rope_scaling: dict[str, Any] | None = None,
         max_position_embedding: int = 8192,
         head_dim: int = 256,
         cache_config: CacheConfig | None = None,
@@ -198,7 +198,8 @@ class Step3TextAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embedding,
-            rope_parameters=rope_parameters,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         scaling = self.head_dim**-0.5
         self.attn = Attention(
@@ -226,13 +227,15 @@ class Step3TextAttention(nn.Module):
 class Step3TextDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Step3TextConfig,
+        config: ModelConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = config.hf_config
         self.hidden_size = config.hidden_size
+        rope_scaling = getattr(config, "rope_scaling", None)
 
         self.self_attn = Step3TextAttention(
             hidden_size=self.hidden_size,
@@ -244,7 +247,8 @@ class Step3TextDecoderLayer(nn.Module):
             max_position_embedding=config.max_position_embedding,
             head_dim=config.head_dim,
             share_q_dim=config.share_q_dim,
-            rope_parameters=config.rope_parameters,
+            rope_theta=config.rope_theta,
+            rope_scaling=rope_scaling,
             prefix=f"{prefix}.self_attn",
         )
 
@@ -334,7 +338,7 @@ class Step3TextModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Step3TextDecoderLayer(
-                config=config,
+                config=vllm_config.model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,

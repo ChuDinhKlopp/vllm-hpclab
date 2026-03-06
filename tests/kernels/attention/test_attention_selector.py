@@ -7,10 +7,10 @@ import pytest
 import torch
 
 from vllm.attention.selector import _cached_get_attn_backend, get_attn_backend
-from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.cuda import CudaPlatform
 from vllm.platforms.rocm import RocmPlatform
+from vllm.utils import STR_BACKEND_ENV_VAR, STR_FLASH_ATTN_VAL, STR_INVALID_VAL
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +33,7 @@ DEVICE_MLA_BACKENDS = {
 }
 
 DEVICE_REGULAR_ATTN_BACKENDS = {
-    "cuda": ["FLASHINFER", "FLASH_ATTN"],
+    "cuda": ["XFORMERS", "FLASHINFER", "FLASH_ATTN"],
     "hip": ["ROCM_ATTN"],
     "cpu": ["CPU_ATTN"],
 }
@@ -47,11 +47,9 @@ DEVICE_MLA_BLOCK_SIZES = {
 
 
 def generate_params():
-    is_rocm = current_platform.is_rocm()
     params = []
-    device_list = ["cuda", "cpu"] if not is_rocm else ["hip", "cpu"]
     for use_mla in [True, False]:
-        for device in device_list:
+        for device in ["cuda", "hip", "cpu"]:
             backends = (
                 DEVICE_MLA_BACKENDS[device]
                 if use_mla
@@ -82,7 +80,7 @@ def test_env(
 ):
     """Test attention backend selection with valid device-backend pairs."""
     with monkeypatch.context() as m:
-        m.setenv("VLLM_ATTENTION_BACKEND", name)
+        m.setenv(STR_BACKEND_ENV_VAR, name)
         m.setenv("VLLM_MLA_DISABLE", "1" if use_mla else "0")
 
         if device == "cpu":
@@ -206,6 +204,12 @@ def test_env(
                     )
                     expected = "FLASHINFER"
                     assert backend.get_name() == expected
+                elif name == "XFORMERS":
+                    backend = get_attn_backend(
+                        32, torch.float16, None, block_size, use_mla=use_mla
+                    )
+                    expected = "XFORMERS"
+                    assert backend.get_name() == expected
                 elif name == "FLASH_ATTN":
                     backend = get_attn_backend(
                         32, torch.float16, None, block_size, use_mla=use_mla
@@ -236,27 +240,27 @@ def test_flash_attn(monkeypatch: pytest.MonkeyPatch):
     )
 
     with monkeypatch.context() as m:
-        m.setenv("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+        m.setenv(STR_BACKEND_ENV_VAR, STR_FLASH_ATTN_VAL)
 
         # Unsupported CUDA arch
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _=None: (7, 5))
         backend = get_attn_backend(16, torch.float16, None, 16)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
         # Reset the monkeypatch for subsequent tests
         monkeypatch.undo()
 
         # Unsupported data type
         backend = get_attn_backend(16, torch.float8_e4m3fn, None, 16)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
         # Unsupported kv cache data type
         backend = get_attn_backend(16, torch.float16, "fp8", 16)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
         # Unsupported block size
         backend = get_attn_backend(16, torch.float16, None, 8)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
         # flash-attn is not installed
         import sys
@@ -264,7 +268,7 @@ def test_flash_attn(monkeypatch: pytest.MonkeyPatch):
         original_module = sys.modules.get("vllm_flash_attn")
         monkeypatch.setitem(sys.modules, "vllm_flash_attn", None)
         backend = get_attn_backend(16, torch.float16, None, 16)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
         # Restore the original module if it existed
         if original_module is not None:
@@ -274,7 +278,7 @@ def test_flash_attn(monkeypatch: pytest.MonkeyPatch):
 
         # Unsupported head size
         backend = get_attn_backend(17, torch.float16, None, 16)
-        assert backend.get_name() != "FLASH_ATTN"
+        assert backend.get_name() != STR_FLASH_ATTN_VAL
 
 
 def test_invalid_env(monkeypatch: pytest.MonkeyPatch):
@@ -283,7 +287,7 @@ def test_invalid_env(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.context() as m,
         patch("vllm.platforms.current_platform", CudaPlatform()),
     ):
-        m.setenv("VLLM_ATTENTION_BACKEND", "INVALID")
+        m.setenv(STR_BACKEND_ENV_VAR, STR_INVALID_VAL)
 
         # Should raise ValueError for invalid backend
         with pytest.raises(ValueError) as exc_info:

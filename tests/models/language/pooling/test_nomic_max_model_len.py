@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: SIM117
-from typing import Any
-
 import pytest
 
 from ...utils import EmbedModelInfo
@@ -81,8 +79,8 @@ def test_set_max_model_len_illegal(model_info, vllm_runner):
 @pytest.mark.parametrize("model_info", MODELS)
 def test_use_rope_scaling_legal(model_info, vllm_runner):
     hf_overrides = {
-        "rope_parameters": {
-            "rope_theta": rope_theta,
+        "rope_theta": rope_theta,
+        "rope_scaling": {
             "rope_type": "yarn",
             "factor": factor,
             "original_max_position_embeddings": original_max_position_embeddings,
@@ -98,9 +96,9 @@ def test_use_rope_scaling_legal(model_info, vllm_runner):
 
 @pytest.mark.parametrize("model_info", MODELS)
 def test_use_rope_scaling_illegal(model_info, vllm_runner):
-    hf_overrides: dict[str, Any] = {
-        "rope_parameters": {
-            "rope_theta": rope_theta,
+    hf_overrides = {
+        "rope_theta": rope_theta,
+        "rope_scaling": {
             "rope_type": "yarn",
             "factor": factor,
             "original_max_position_embeddings": original_max_position_embeddings,
@@ -117,8 +115,8 @@ def test_use_rope_scaling_illegal(model_info, vllm_runner):
             pass
 
     hf_overrides = {
-        "rope_parameters": {
-            "rope_theta": rope_theta,
+        "rope_theta": rope_theta,
+        "rope_scaling": {
             "rope_type": "yarn",
             "factor": factor,
             "original_max_position_embeddings": original_max_position_embeddings,

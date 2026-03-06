@@ -31,7 +31,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.attention.layer import Attention
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -77,27 +77,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-# NOTE(ducct) 
-import vllm.envs as envs
-
-import time
-import torch
-from pathlib import Path
-
-TIMING_LOG_PATH = Path(f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/timing/{envs.LOG_SUFFIX}.csv")
-
-def log_header_if_needed():
-    if not TIMING_LOG_PATH.exists():
-        with TIMING_LOG_PATH.open("w") as f:
-            f.write("step,layer,gpu_id,attn_ms,mlp_ms\n")
-
-def log_attn_mlp(step_num: int, layer_id: int, attn_ms: float, mlp_ms: float, device) -> None:
-    log_header_if_needed()
-    gpu_id = getattr(device, "index", -1)  # -1 for CPU
-    with TIMING_LOG_PATH.open("a") as f:
-        f.write(f"{step_num},{layer_id},{gpu_id},{attn_ms:.4f},{mlp_ms:.4f}\n")
-
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -237,7 +216,8 @@ class Qwen3MoeAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_parameters: dict[str, Any],
+        rope_theta: float = 10000,
+        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 8192,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
@@ -267,6 +247,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
@@ -292,7 +273,8 @@ class Qwen3MoeAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
-            rope_parameters=rope_parameters,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = Attention(
@@ -344,6 +326,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
@@ -352,7 +336,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            rope_parameters=config.rope_parameters,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
@@ -399,42 +384,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        # NOTE(ducct)
-        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
-            is_cuda = hidden_states.is_cuda
-            device = hidden_states.device if is_cuda else torch.device("cpu")
-            if is_cuda:
-                torch.cuda.synchronize(device)
-            t0 = time.perf_counter()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
-            if is_cuda:
-                torch.cuda.synchronize(device)
-            t1 = time.perf_counter()
-            attn_input_shape = hidden_states.shape
-            attn_ms = (t1 - t0) * 1000.0
-
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        # NOTE(ducct)
-        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
-            if is_cuda:
-                torch.cuda.synchronize(device)
-            t2 = time.perf_counter()
-            mlp_input_shape = hidden_states.shape
         hidden_states = self.mlp(hidden_states)
-        if envs.ENABLE_LATENCY_PROFILE and envs.STEP_NUM != 0:
-            if is_cuda:
-                torch.cuda.synchronize(device)
-            t3 = time.perf_counter()
-            mlp_ms = (t3 - t2) * 1000.0
-            log_attn_mlp(envs.STEP_NUM, envs.LAYER_ID, attn_ms, mlp_ms, device)
-
         return hidden_states, residual
 
 
@@ -496,10 +453,6 @@ class Qwen3MoeModel(nn.Module):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            # NOTE(ducct)
-            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
-                envs.LAYER_ID = layer_idx
-
             # Collect auxiliary hidden states if specified
             if layer_idx in self.aux_hidden_state_layers:
                 aux_hidden_state = (

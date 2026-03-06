@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Iterable
 from functools import reduce
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar, overload
+from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast, overload
 
 if TYPE_CHECKING:
     import torch
@@ -82,13 +82,16 @@ def json_map_leaves(
 
 def json_map_leaves(
     func: Callable[[_T], _U],
-    value: Any,
+    value: "BatchedTensorInputs" | _JSONTree[_T],
 ) -> "BatchedTensorInputs" | _JSONTree[_U]:
     """Apply a function to each leaf in a nested JSON structure."""
     if isinstance(value, dict):
-        return {k: json_map_leaves(func, v) for k, v in value.items()}  # type: ignore
+        return {
+            k: json_map_leaves(func, v)  # type: ignore[arg-type]
+            for k, v in value.items()
+        }
     elif isinstance(value, list):
-        return [json_map_leaves(func, v) for v in value]  # type: ignore
+        return [json_map_leaves(func, v) for v in value]
     elif isinstance(value, tuple):
         return tuple(json_map_leaves(func, v) for v in value)
     else:
@@ -137,9 +140,9 @@ def json_reduce_leaves(
 
 
 def json_reduce_leaves(
-    func: Callable[[_T, _T], _T] | Callable[[_U, _T], _U],
+    func: Callable[..., _T | _U],
     value: _JSONTree[_T],
-    initial: _U = ...,  # type: ignore[assignment]
+    initial: _U = cast(_U, ...),  # noqa: B008
     /,
 ) -> _T | _U:
     """
@@ -148,9 +151,13 @@ def json_reduce_leaves(
     sequence to a single value.
     """
     if initial is ...:
-        return reduce(func, json_iter_leaves(value))  # type: ignore
+        return reduce(func, json_iter_leaves(value))  # type: ignore[arg-type]
 
-    return reduce(func, json_iter_leaves(value), initial)  # type: ignore
+    return reduce(
+        func,  # type: ignore[arg-type]
+        json_iter_leaves(value),
+        initial,
+    )
 
 
 def json_count_leaves(value: JSONTree[_T]) -> int:

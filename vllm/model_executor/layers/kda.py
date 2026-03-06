@@ -5,6 +5,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm.attention import AttentionBackend
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -82,7 +83,12 @@ direct_register_custom_op(
 class KimiDeltaAttention(nn.Module, MambaBase):
     @property
     def mamba_type(self) -> str:
-        return "gdn_attention"
+        return "linear_attention"
+
+    def get_attn_backend(self) -> type["AttentionBackend"]:
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+
+        return GDNAttentionBackend
 
     def get_state_dtype(
         self,

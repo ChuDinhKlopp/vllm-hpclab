@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, TypeVar
-
-_T = TypeVar("_T", bound=type)
+from typing import Any
 
 
 class ExtensionManager:
@@ -36,7 +34,7 @@ class ExtensionManager:
         Decorator to register a class with the given name.
         """
 
-        def wrap(cls_to_register: _T) -> _T:
+        def wrap(cls_to_register):
             self.name2class[name] = cls_to_register
             return cls_to_register
 

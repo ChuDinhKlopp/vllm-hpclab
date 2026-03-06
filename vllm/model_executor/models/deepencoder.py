@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from transformers import CLIPVisionConfig
 
 from vllm.attention.layer import MultiHeadAttention
-from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -134,14 +133,14 @@ class ImageEncoderViT(nn.Module):
             self.blocks.append(block)
 
         self.neck = nn.Sequential(
-            Conv2dLayer(
+            nn.Conv2d(
                 embed_dim,
                 out_chans,
                 kernel_size=1,
                 bias=False,
             ),
             LayerNorm2d(out_chans),
-            Conv2dLayer(
+            nn.Conv2d(
                 out_chans,
                 out_chans,
                 kernel_size=3,
@@ -151,10 +150,8 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-        self.net_2 = Conv2dLayer(
-            256, 512, kernel_size=3, stride=2, padding=1, bias=False
-        )
-        self.net_3 = Conv2dLayer(
+        self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
+        self.net_3 = nn.Conv2d(
             512, 1024, kernel_size=3, stride=2, padding=1, bias=False
         )
 
@@ -503,7 +500,7 @@ class PatchEmbed(nn.Module):
         """
         super().__init__()
 
-        self.proj = Conv2dLayer(
+        self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
         )
 

@@ -16,7 +16,7 @@ from vllm.inputs.data import EmbedsPrompt as EngineEmbedsPrompt
 from vllm.inputs.data import TextPrompt as EngineTextPrompt
 from vllm.inputs.data import TokensPrompt as EngineTokensPrompt
 from vllm.inputs.parse import get_prompt_components, parse_raw_prompts
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils.async_utils import AsyncMicrobatchTokenizer
 
 
@@ -33,7 +33,7 @@ class RenderConfig:
     `0` yields an empty list (and skips embeds).
     `-1` maps to `model_config.max_model_len`."""
 
-    add_special_tokens: bool = True
+    add_special_tokens: bool | None = True
     """Whether to add model-specific special tokens during tokenization."""
 
     cache_salt: str | None = None
@@ -85,7 +85,7 @@ class BaseRenderer(ABC):
     def __init__(
         self,
         model_config: ModelConfig,
-        tokenizer: TokenizerLike | None = None,
+        tokenizer: AnyTokenizer | None = None,
     ):
         super().__init__()
         self.model_config = model_config
@@ -200,8 +200,8 @@ class CompletionRenderer(BaseRenderer):
     def __init__(
         self,
         model_config: ModelConfig,
-        tokenizer: TokenizerLike | None = None,
-        async_tokenizer_pool: dict[TokenizerLike, AsyncMicrobatchTokenizer]
+        tokenizer: AnyTokenizer | None = None,
+        async_tokenizer_pool: dict[AnyTokenizer, AsyncMicrobatchTokenizer]
         | None = None,
     ):
         super().__init__(model_config, tokenizer)
@@ -315,7 +315,7 @@ class CompletionRenderer(BaseRenderer):
         text: str,
         max_length: int | None,
         truncate_prompt_tokens: int | None,
-        add_special_tokens: bool,
+        add_special_tokens: bool | None,
         cache_salt: str | None,
     ) -> EngineTokensPrompt:
         """Tokenize text input asynchronously."""
@@ -373,7 +373,7 @@ class CompletionRenderer(BaseRenderer):
             return async_tokenizer
 
         tokenizer = self.tokenizer
-        if tokenizer is None:
+        if self.tokenizer is None:
             raise ValueError("No tokenizer available for text input processing")
 
         if self.async_tokenizer_pool is None:

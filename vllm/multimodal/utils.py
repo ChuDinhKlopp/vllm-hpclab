@@ -3,7 +3,7 @@
 
 import asyncio
 import atexit
-from collections.abc import Generator, Set
+from collections.abc import Iterable, Set
 from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
 from pathlib import Path
@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.registry import ExtensionManager
 
-from .audio import AudioEmbeddingMediaIO, AudioMediaIO
+from .audio import AudioMediaIO
 from .base import MediaIO
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
@@ -342,17 +342,6 @@ class MediaConnector:
 
         return image_embedding_io.load_base64("", data)
 
-    def fetch_audio_embedding(
-        self,
-        data: str,
-    ) -> torch.Tensor:
-        """
-        Load audio embedding from a URL.
-        """
-        audio_embedding_io = AudioEmbeddingMediaIO()
-
-        return audio_embedding_io.load_base64("", data)
-
 
 def encode_audio_base64(
     audio: np.ndarray,
@@ -414,7 +403,7 @@ def group_mm_kwargs_by_modality(
     pin_memory: bool = False,
     merge_by_field_config: bool | None = None,
     multimodal_cpu_fields: Set[str] = frozenset(),
-) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
+) -> Iterable[tuple[str, int, BatchedTensorInputs]]:
     """Group consecutive `MultiModalKwargsItem`s from `mm_kwargs` with the same
     modality together into the same `MultiModalKwargs` instance.
 

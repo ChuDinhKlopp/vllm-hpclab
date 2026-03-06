@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import (
     StructuredOutputsParams,
 )
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import import_from_path
 
@@ -36,7 +36,7 @@ class ToolParser:
     derived classes.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
+    def __init__(self, tokenizer: AnyTokenizer):
         self.prev_tool_call_arr: list[dict] = []
         # the index of the tool call that is currently being parsed
         self.current_tool_id: int = -1

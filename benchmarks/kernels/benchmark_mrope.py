@@ -6,7 +6,7 @@
 #
 # The CSV file (named with current date/time) contains these columns:
 # model_name, tp_size, num_tokens, num_heads, num_kv_heads, head_dim, max_position,
-# is_neox_style, rope_parameters, dtype, torch_mean, torch_median, torch_p99,
+# rope_theta, is_neox_style, rope_scaling, dtype, torch_mean, torch_median, torch_p99,
 # torch_min, torch_max, triton_mean, triton_median, triton_p99, triton_min, triton_max,
 # speedup
 #
@@ -86,8 +86,9 @@ def benchmark_mrope(
     num_heads: int,
     num_kv_heads: int,
     max_position: int = 8192,
+    rope_theta: float = 10000,
     is_neox_style: bool = True,
-    rope_parameters: dict[str, Any] | None = None,
+    rope_scaling: dict[str, Any] = None,
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
     warmup_iter: int = 10,
@@ -101,8 +102,9 @@ def benchmark_mrope(
         head_size=head_dim,
         rotary_dim=head_dim,
         max_position=max_position,
+        base=rope_theta,
         is_neox_style=is_neox_style,
-        rope_parameters=rope_parameters,
+        rope_scaling=rope_scaling,
         dtype=dtype,
     ).to(device=device)
 
@@ -201,8 +203,9 @@ def benchmark_mrope(
             num_kv_heads,
             head_dim,
             max_position,
+            rope_theta,
             is_neox_style,
-            str(rope_parameters),
+            str(rope_scaling),
             str(dtype).split(".")[-1],
             torch_stats["mean"],
             torch_stats["median"],
@@ -252,8 +255,9 @@ if __name__ == "__main__":
             "num_kv_heads",
             "head_dim",
             "max_position",
+            "rope_theta",
             "is_neox_style",
-            "rope_parameters",
+            "rope_scaling",
             "dtype",
             "torch_mean",
             "torch_median",
@@ -299,7 +303,7 @@ if __name__ == "__main__":
                 q_size = num_heads * head_dim
                 kv_size = num_kv_heads * head_dim
                 is_neox_style = True
-                rope_parameters = config.rope_parameters
+                rope_theta = config.rope_theta
                 max_position = config.max_position_embeddings
 
                 for num_tokens in num_tokens_list:
@@ -311,8 +315,9 @@ if __name__ == "__main__":
                         num_heads=num_heads,
                         num_kv_heads=num_kv_heads,
                         max_position=max_position,
+                        rope_theta=rope_theta,
                         is_neox_style=is_neox_style,
-                        rope_parameters=rope_parameters,
+                        rope_scaling=config.rope_scaling,
                         dtype=getattr(torch, args.dtype),
                         seed=args.seed,
                         warmup_iter=args.warmup_iter,

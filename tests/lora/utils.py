@@ -28,6 +28,7 @@ class DummyLoRAManager:
         module_name: str,
         weight: torch.Tensor,
         rank: int = 8,
+        generate_embeddings_tensor: int = 0,
     ):
         lora = LoRALayerWeights(
             module_name,
@@ -40,6 +41,13 @@ class DummyLoRAManager:
                 [weight.shape[0], rank], dtype=weight.dtype, device=self._device
             ),
         )
+        if generate_embeddings_tensor:
+            lora.embeddings_tensor = torch.rand(
+                5,
+                generate_embeddings_tensor,
+                dtype=weight.dtype,
+                device=self._device,
+            )
         self.set_module_lora(module_name, lora)
 
         return lora

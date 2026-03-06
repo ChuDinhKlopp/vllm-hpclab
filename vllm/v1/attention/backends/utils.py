@@ -24,15 +24,12 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.attention.backends.abstract import AttentionImpl
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm.envs as envs
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-)
+from vllm.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     get_kv_connector_cache_layout,
 )
@@ -75,7 +72,6 @@ class CommonAttentionMetadata:
 
     num_reqs: int
     """Number of requests"""
-    # TODO(lucas): rename to num_tokens since it may be padded and this is misleading
     num_actual_tokens: int
     """Total number of tokens in batch"""
     max_query_len: int
@@ -93,38 +89,11 @@ class CommonAttentionMetadata:
     num_logits_indices: int | None = None
 
     # Needed by CrossAttentionBuilder
-    encoder_seq_lens: torch.Tensor | None = None
-    encoder_seq_lens_cpu: np.ndarray | None = None
+    encoder_seq_lens: np.ndarray | None = None
 
     dcp_local_seq_lens: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
-
-    # TODO(lucas): remove once we have FULL-CG spec-decode support
-    def unpadded(
-        self, num_actual_tokens: int, num_actual_reqs: int
-    ) -> "CommonAttentionMetadata":
-        maybe_slice_reqs = lambda x: x[:num_actual_reqs] if x is not None else None
-        return CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
-            seq_lens=self.seq_lens[:num_actual_reqs],
-            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
-            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
-            num_reqs=num_actual_reqs,
-            num_actual_tokens=num_actual_tokens,
-            max_query_len=self.max_query_len,
-            max_seq_len=self.max_seq_len,
-            block_table_tensor=self.block_table_tensor[:num_actual_reqs],
-            slot_mapping=self.slot_mapping[:num_actual_tokens],
-            causal=self.causal,
-            logits_indices_padded=self.logits_indices_padded,
-            num_logits_indices=self.num_logits_indices,
-            encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
-            encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
-            dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
-            dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
-        )
 
 
 def slice_query_start_locs(
@@ -166,7 +135,9 @@ def _make_metadata_with_slice(
     assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], (
         "Token slice start outside of first request"
     )
-    # NOTE: last token can be outside of the last request if we have CG padding.
+    assert start_locs[last_req] <= last_tok < start_locs[last_req + 1], (
+        "Token slice end outside of last request"
+    )
 
     # If the "middle" request has tokens in both ubatches, we have to split it.
     # If ubatch_slice is the first ubatch then we will be splitting the last
@@ -885,9 +856,7 @@ def split_decodes_and_prefills(
     if require_uniform:
         is_prefill = query_lens != query_lens[0]
     else:
-        # 0-query len indicates a padded request; leave this at the back
-        # of the batch with the prefills
-        is_prefill = (query_lens > decode_threshold) | (query_lens == 0)
+        is_prefill = query_lens > decode_threshold
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
@@ -1111,9 +1080,9 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
 
 def get_dcp_local_seq_lens(
     seq_lens: torch.Tensor,
-    dcp_size: int = 1,
+    dcp_world_size: int = 1,
     dcp_rank: int | None = None,
-    cp_kv_cache_interleave_size: int = 1,
+    dcp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     """While using dcp, kv_cache size stored on each rank may be different,
     use this function to calculate split decode seq_lens of each dcp rank.
@@ -1122,28 +1091,26 @@ def get_dcp_local_seq_lens(
     num_requests = seq_lens.size(0)
     if dcp_rank is None:
         rank_offsets = (
-            torch.arange(dcp_size, dtype=torch.int32, device=seq_lens.device)
+            torch.arange(dcp_world_size, dtype=torch.int32)
             .unsqueeze(0)
             .repeat(num_requests, 1)
         )
     else:
-        rank_offsets = torch.tensor(
-            [[dcp_rank]], dtype=torch.int32, device=seq_lens.device
-        )
+        rank_offsets = torch.Tensor([[dcp_rank]]).to(dtype=torch.int32)
     seq_lens_tiled = (
         seq_lens.to(torch.int32).unsqueeze(-1).repeat(1, rank_offsets.shape[1])
     )
     base = (
         seq_lens_tiled
-        // cp_kv_cache_interleave_size
-        // dcp_size
-        * cp_kv_cache_interleave_size
+        // dcp_kv_cache_interleave_size
+        // dcp_world_size
+        * dcp_kv_cache_interleave_size
     )
-    remainder = seq_lens_tiled - base * dcp_size
+    remainder = seq_lens_tiled - base * dcp_world_size
     remainder = torch.clip(
-        remainder - rank_offsets * cp_kv_cache_interleave_size,
+        remainder - rank_offsets * dcp_kv_cache_interleave_size,
         0,
-        cp_kv_cache_interleave_size,
+        dcp_kv_cache_interleave_size,
     )
     dcp_local_seq_lens = base + remainder
     return dcp_local_seq_lens.squeeze(1)

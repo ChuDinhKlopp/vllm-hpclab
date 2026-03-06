@@ -11,7 +11,7 @@ from tests.entrypoints.openai.tool_parsers.utils import (
 )
 from vllm.entrypoints.openai.protocol import FunctionCall
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 # Test cases similar to pythonic parser but with Llama4 specific format
 SIMPLE_FUNCTION_OUTPUT = "[get_weather(city='LA', metric='C')]"
@@ -64,7 +64,7 @@ PYTHON_TAG_FUNCTION_OUTPUT = (
 
 
 @pytest.mark.parametrize("streaming", [True, False])
-def test_no_tool_call(streaming: bool, default_tokenizer: TokenizerLike):
+def test_no_tool_call(streaming: bool, default_tokenizer: AnyTokenizer):
     tool_parser: ToolParser = ToolParserManager.get_tool_parser("llama4_pythonic")(
         default_tokenizer
     )
@@ -208,7 +208,7 @@ def test_tool_call(
     streaming: bool,
     model_output: str,
     expected_tool_calls: list[FunctionCall],
-    default_tokenizer: TokenizerLike,
+    default_tokenizer: AnyTokenizer,
 ):
     tool_parser: ToolParser = ToolParserManager.get_tool_parser("llama4_pythonic")(
         default_tokenizer
@@ -224,7 +224,7 @@ def test_tool_call(
         assert actual.function == expected
 
 
-def test_streaming_tool_call_with_large_steps(default_tokenizer: TokenizerLike):
+def test_streaming_tool_call_with_large_steps(default_tokenizer: AnyTokenizer):
     tool_parser: ToolParser = ToolParserManager.get_tool_parser("llama4_pythonic")(
         default_tokenizer
     )
@@ -246,7 +246,7 @@ def test_streaming_tool_call_with_large_steps(default_tokenizer: TokenizerLike):
 
 
 @pytest.mark.parametrize("streaming", [False])
-def test_regex_timeout_handling(streaming: bool, default_tokenizer: TokenizerLike):
+def test_regex_timeout_handling(streaming: bool, default_tokenizer: AnyTokenizer):
     """test regex timeout is handled gracefully"""
     tool_parser: ToolParser = ToolParserManager.get_tool_parser("llama4_pythonic")(
         default_tokenizer

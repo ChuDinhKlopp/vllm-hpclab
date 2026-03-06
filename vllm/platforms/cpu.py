@@ -14,7 +14,6 @@ import regex as re
 import torch
 
 from vllm import envs
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
 
 from .interface import CpuArchEnum, Platform, PlatformEnum
@@ -22,8 +21,10 @@ from .interface import CpuArchEnum, Platform, PlatformEnum
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.attention.backends.registry import AttentionBackendEnum
     from vllm.config import VllmConfig
 else:
+    AttentionBackendEnum = None
     VllmConfig = None
 
 
@@ -134,6 +135,8 @@ class CpuPlatform(Platform):
         use_sparse: bool,
         attn_type: str | None = None,
     ) -> str:
+        from vllm.attention.backends.registry import AttentionBackendEnum
+
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info("Cannot use %s backend on CPU.", selected_backend)
         if use_mla:
@@ -384,6 +387,7 @@ class CpuPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
+        logger.warning("Pin memory is not supported on CPU.")
         return False
 
     @classmethod

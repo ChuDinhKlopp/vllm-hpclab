@@ -21,14 +21,14 @@ from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
 from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
 
 class xLAMToolParser(ToolParser):
-    def __init__(self, tokenizer: TokenizerLike):
+    def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
 
         # Initialize state for streaming mode

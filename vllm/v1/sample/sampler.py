@@ -81,10 +81,7 @@ class Sampler(nn.Module):
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
             elif logprobs_mode == "raw_logits":
-                if logits.dtype == torch.float32:
-                    raw_logprobs = logits.clone()
-                else:
-                    raw_logprobs = logits.to(torch.float32)
+                raw_logprobs = logits.clone()
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)

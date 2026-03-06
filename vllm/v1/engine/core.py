@@ -65,9 +65,6 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
-# NOTE(ducct)
-import vllm.envs as envs
-
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -122,17 +119,15 @@ class EngineCore:
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
+        if len(kv_cache_config.kv_cache_groups) == 0:
             # Encoder models without KV cache don't support
             # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
+            logger.info("Disabling chunked prefill for model without KVCache")
+            vllm_config.scheduler_config.enable_chunked_prefill = False
 
         scheduler_block_size = (
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
-            * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
         self.scheduler: SchedulerInterface = Scheduler(
@@ -185,7 +180,7 @@ class EngineCore:
             logger.info("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-        self.is_ec_producer = (
+        self.ec_producer = (
             vllm_config.ec_transfer_config is not None
             and vllm_config.ec_transfer_config.is_ec_producer
         )
@@ -210,8 +205,6 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
-        # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -397,7 +390,7 @@ class EngineCore:
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
-            if not self.is_ec_producer:
+            if not self.ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
@@ -486,8 +479,8 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
-    def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
-        return self.scheduler.reset_prefix_cache(reset_running_requests)
+    def reset_prefix_cache(self):
+        self.scheduler.reset_prefix_cache()
 
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
@@ -650,6 +643,9 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+        # If enable, attach GC debugger after static variable freeze.
+        maybe_attach_gc_debug_callback()
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -860,10 +856,6 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
-            # NOTE(ducct)
-            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE:
-                envs.STEP_NUM += 1
-
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
@@ -1214,10 +1206,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
-            # NOTE(ducct)
-            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE or envs.ENABLE_LATENCY_PROFILE:
-                envs.STEP_NUM += 1
-
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 

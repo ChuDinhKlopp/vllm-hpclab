@@ -11,6 +11,7 @@ import pytest
 from tests.quantization.utils import is_quant_method_supported
 from vllm.attention.utils.fa_utils import flash_attn_supports_fp8
 from vllm.platforms import current_platform
+from vllm.utils import STR_BACKEND_ENV_VAR
 from ..utils import check_logprobs_close
 
 
@@ -75,7 +76,7 @@ def test_models(
 
     with monkeypatch.context() as m:
         m.setenv("TOKENIZERS_PARALLELISM", "true")
-        m.setenv("VLLM_ATTENTION_BACKEND", backend)
+        m.setenv(STR_BACKEND_ENV_VAR, backend)
 
         MAX_MODEL_LEN = 1024
         NUM_LOG_PROBS = 8

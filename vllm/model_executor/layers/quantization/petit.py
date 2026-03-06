@@ -8,7 +8,6 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm.attention.layer import Attention
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -160,6 +159,8 @@ class PetitNvFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from vllm.attention.layer import Attention  # Avoid circular import
+
         exclude = self.require_exclude_modules()
 
         if isinstance(layer, LinearBase):

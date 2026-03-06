@@ -29,7 +29,7 @@ from vllm.entrypoints.openai.tool_parsers.utils import (
     partial_json_loads,
 )
 from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 logger = init_logger(__name__)
 
@@ -44,7 +44,7 @@ class Granite20bFCToolParser(ToolParser):
     are all set
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
+    def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
 
         self.bot_token = "<function_call>"

@@ -144,7 +144,7 @@ class SpecDecodingProm:
         self,
         speculative_config: SpeculativeConfig | None,
         labelnames: list[str],
-        per_engine_labelvalues: dict[int, list[object]],
+        per_engine_labelvalues: dict[int, list[str]],
     ):
         self.spec_decoding_enabled = speculative_config is not None
         if not self.spec_decoding_enabled:
@@ -215,8 +215,7 @@ class SpecDecodingProm:
 
 
 def make_per_engine(
-    counter: prometheus_client.Counter,
-    per_engine_labelvalues: dict[int, list[object]],
+    counter: prometheus_client.Counter, per_engine_labelvalues: dict[int, list[str]]
 ):
     """Create a counter for each label value."""
     return {

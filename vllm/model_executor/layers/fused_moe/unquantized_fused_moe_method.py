@@ -42,105 +42,6 @@ else:
 
 logger = init_logger(__name__)
 
-# NOTE(ducct)
-import os
-from typing import List, Dict
-import torch
-EXPERT_ACTIVATION_LOG_DIR = f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/expert_activation_pattern/{envs.LOG_SUFFIX}/"
-
-class BatchedTensorLogger:
-    def __init__(
-        self,
-        log_dir: str = "tensor_logs",
-        batch_size: int = 1296,
-        max_steps_per_file: int = None,
-        filename_format: str = "device_{device:01d}_{start:06d}_{end:06d}.pt",
-    ):
-        self.log_dir = log_dir
-        self.batch_size = batch_size
-        self.max_steps_per_file = max_steps_per_file
-        self.filename_format = filename_format
-
-        self.buffer: List[Dict] = []
-        self.current_start_step = None
-        self.current_device_id = None  # NEW
-
-        os.makedirs(log_dir, exist_ok=True)
-
-    @staticmethod
-    def _normalize_device_id(device: torch.device) -> int:
-        if device.type == "cuda":
-            return device.index
-        return 0  # CPU → device_0
-
-    def log(self, step: int, layer_id: int, tensor: torch.Tensor, device_id: torch.device, **metadata):
-        device_id = self._normalize_device_id(device_id)
-
-        # If device changes mid-buffer → flush
-        if self.current_device_id is not None and device_id != self.current_device_id:
-            self.flush()
-
-        if self.current_start_step is None:
-            self.current_start_step = step
-            self.current_device_id = device_id
-
-        entry = {
-            "step": step,
-            "layer": layer_id,
-            "tensor": tensor.cpu().clone(),
-            "shape": tuple(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "device_id": device_id,
-            **metadata,
-        }
-
-        self.buffer.append(entry)
-
-        if self.max_steps_per_file:
-            if step - self.current_start_step >= self.max_steps_per_file:
-                self.flush()
-        elif len(self.buffer) >= self.batch_size:
-            self.flush()
-
-    def flush(self):
-        if not self.buffer:
-            return
-
-        steps = [e["step"] for e in self.buffer]
-        start_step = min(steps)
-        end_step = max(steps)
-
-        device_id = self.current_device_id
-
-        filename = self.filename_format.format(
-            device=device_id,
-            start=start_step,
-            end=end_step,
-        )
-        filepath = os.path.join(self.log_dir, filename)
-
-        batch_data = {
-            "entries": self.buffer,
-            "count": len(self.buffer),
-            "step_range": (start_step, end_step),
-            "device_id": device_id,
-            "layer_ids": list({e["layer"] for e in self.buffer}),
-            "shapes": list({e["shape"] for e in self.buffer}),
-        }
-
-        torch.save(batch_data, filepath)
-        print(f"Saved {len(self.buffer)} tensors to {filename}")
-
-        self.buffer = []
-        self.current_start_step = None
-        self.current_device_id = None
-
-    def close(self):
-        if self.buffer:
-            self.flush()
-
-batched_logger = BatchedTensorLogger(log_dir=EXPERT_ACTIVATION_LOG_DIR, max_steps_per_file=10)
-
 
 @CustomOp.register("unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -207,14 +108,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def allow_inplace(self) -> bool:
         return True
 
-    def maybe_make_prepare_finalize(
-        self,
-        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    ) -> FusedMoEPrepareAndFinalize | None:
+    def maybe_make_prepare_finalize(self) -> FusedMoEPrepareAndFinalize | None:
         if self.rocm_aiter_moe_enabled:
             return None
         else:
-            return super().maybe_make_prepare_finalize(routing_tables)
+            return super().maybe_make_prepare_finalize()
 
     def select_gemm_impl(
         self,
@@ -362,7 +260,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     layer.w2_weight.copy_(packed_w2_weight)
                     layer.cpu_fused_moe = cpu_fused_moe.SGLFusedMOE(layer)
                 else:
-                    layer.cpu_fused_moe = cpu_fused_moe.CPUFusedMOE(layer)
+                    layer.cpu_fused_moe = cpu_fused_moe.IPEXFusedMOE(layer)
             else:
                 layer.cpu_fused_moe = cpu_fused_moe.CPUFusedMOE(layer)
 
@@ -393,7 +291,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             assert expert_load_view is not None
             assert logical_to_physical_map is not None
             assert logical_replica_count is not None
-            
+
         return self.forward(
             x=x,
             layer=layer,
@@ -430,7 +328,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def forward_cuda(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: torch.nn.Module,
         x: torch.Tensor,
         use_grouped_topk: bool,
         top_k: int,
@@ -451,16 +349,32 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         logical_to_physical_map: torch.Tensor | None = None,
         logical_replica_count: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        zero_expert_num = getattr(layer, "zero_expert_num", 0)
+        zero_expert_type = getattr(layer, "zero_expert_type", None)
+
         topk_weights, topk_ids, zero_expert_result = layer.select_experts(
             hidden_states=x,
             router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            indices_type=self.topk_indices_dtype,
+            enable_eplb=enable_eplb,
+            expert_map=expert_map,
+            expert_load_view=expert_load_view,
+            logical_to_physical_map=logical_to_physical_map,
+            logical_replica_count=logical_replica_count,
+            global_num_experts=global_num_experts,
+            zero_expert_num=zero_expert_num,
+            zero_expert_type=zero_expert_type,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
         )
-
-        # NOTE(ducct)
-        if envs.ENABLE_EXPERT_ACTIVATION_PROFILE and envs.STEP_NUM != 0:
-            device_id = x.device if x.is_cuda else torch.device("cpu")
-            # logger.info(f"STEP: {envs.STEP_NUM}; LAYER: {envs.LAYER_ID}; device: {device_id}; topk ids: {topk_ids} - {topk_ids.shape}")
-            batched_logger.log(step=envs.STEP_NUM, layer_id=envs.LAYER_ID, tensor=topk_ids, device_id=device_id)
 
         if self.rocm_aiter_moe_enabled:
             result = self.rocm_aiter_fused_experts(
@@ -498,7 +412,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 expert_map=expert_map,
             )
 
-        if layer.zero_expert_num != 0 and layer.zero_expert_type is not None:
+        if zero_expert_num != 0 and zero_expert_type is not None:
             assert not isinstance(result, tuple), (
                 "Shared + zero experts are mutually exclusive not yet supported"
             )
@@ -508,7 +422,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def forward_cpu(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: torch.nn.Module,
         x: torch.Tensor,
         use_grouped_topk: bool,
         top_k: int,
@@ -557,7 +471,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def forward_xpu(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: torch.nn.Module,
         x: torch.Tensor,
         use_grouped_topk: bool,
         top_k: int,
@@ -598,7 +512,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def forward_tpu(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: torch.nn.Module,
         x: torch.Tensor,
         use_grouped_topk: bool,
         top_k: int,

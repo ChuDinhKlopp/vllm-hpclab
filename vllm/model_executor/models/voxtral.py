@@ -51,7 +51,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.sequence import IntermediateTensors
-from vllm.tokenizers import MistralTokenizer, cached_tokenizer_from_config
+from vllm.transformers_utils.tokenizer import (
+    MistralTokenizer,
+    cached_tokenizer_from_config,
+)
 
 from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsTranscription
 from .utils import init_vllm_registered_model, maybe_prefix

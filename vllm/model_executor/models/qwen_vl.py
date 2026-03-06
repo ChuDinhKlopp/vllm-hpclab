@@ -25,7 +25,6 @@ from transformers.tokenization_utils_base import TextInput
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -334,7 +333,7 @@ class VisionTransformer(nn.Module):
         patch_height, patch_width = self.patch_size = (patch_size, patch_size)
         self.grid_size = (image_height // patch_height, image_width // patch_width)
         self.output_dim = output_dim
-        self.conv1 = Conv2dLayer(
+        self.conv1 = nn.Conv2d(
             in_channels=3,
             out_channels=width,
             kernel_size=patch_size,
@@ -555,7 +554,7 @@ class QwenVLProcessor:
 
 class QwenVLProcessingInfo(BaseProcessingInfo):
     def get_tokenizer(self) -> PreTrainedTokenizer:
-        tokenizer = self.ctx.get_tokenizer()
+        tokenizer = self.ctx.tokenizer
         assert isinstance(tokenizer, PreTrainedTokenizer)
 
         return _get_tokenizer_without_image_pad(tokenizer)

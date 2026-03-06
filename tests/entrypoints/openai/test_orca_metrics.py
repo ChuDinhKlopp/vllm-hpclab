@@ -8,7 +8,7 @@ import pytest_asyncio
 from ...utils import RemoteOpenAIServer
 
 # any model with a chat template should work here
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
 
 
 @pytest.fixture(scope="module")
@@ -110,9 +110,8 @@ async def test_single_completion(client: openai.AsyncOpenAI):
     choice = completion.choices[0]
     assert len(choice.text) >= 5
     assert choice.finish_reason == "length"
-    # When using Qwen3-0.6B, prompt tokens=[9707, 11, 847, 829, 374]
     assert completion.usage == openai.types.CompletionUsage(
-        completion_tokens=5, prompt_tokens=5, total_tokens=10
+        completion_tokens=5, prompt_tokens=6, total_tokens=11
     )
 
     # test using token IDs

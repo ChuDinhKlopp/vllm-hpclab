@@ -25,7 +25,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-_CPU_ARCH_PREFER_MIXED_BATCH = (CpuArchEnum.X86, CpuArchEnum.ARM)
+_CPU_ARCH_PREFER_MIXED_BATCH = (CpuArchEnum.X86,)
 
 
 class CPUAttentionBackend(AttentionBackend):
@@ -51,6 +51,8 @@ class CPUAttentionBackend(AttentionBackend):
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         """CPU attention supports decoder and encoder-only attention."""
+        from vllm.attention import AttentionType
+
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
@@ -489,9 +491,6 @@ def _get_attn_isa(dtype: torch.dtype, block_size: int) -> str:
     if supports_amx and dtype in (torch.bfloat16,) and block_size % 32 == 0:
         return "amx"
     elif block_size % 32 == 0:
-        if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
-            return "neon"
-        else:
-            return "vec"
+        return "vec"
     else:
         return "vec16"

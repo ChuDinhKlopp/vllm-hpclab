@@ -63,18 +63,23 @@ class RowParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
         # Matrix multiply.
-        bias_ = (
-            None
-            if (self.tp_rank > 0 or self.base_layer.skip_bias_add)
-            else self.base_layer.bias
-        )
-        output_parallel = self.apply(input_parallel, bias_)
+        output_parallel = self.apply(input_parallel)
         if self.base_layer.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
-            output = output_parallel
+            output_ = output_parallel
 
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        if not self.base_layer.skip_bias_add:
+            output = (
+                output_ + self.base_layer.bias
+                if self.base_layer.bias is not None
+                else output_
+            )
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.base_layer.bias
+
         if not self.base_layer.return_bias:
             return output
 
@@ -87,7 +92,7 @@ class RowParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         return type(source_layer) is RowParallelLinear
 
@@ -115,7 +120,7 @@ class RowParallelLinearWithShardedLoRA(RowParallelLinearWithLoRA):
         return lora_b
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        output = self.base_layer.quant_method.apply(self.base_layer, x)
 
         x = x.view(-1, x.shape[-1])
         output, out_orig_shape = output.view(-1, output.shape[-1]), output.shape
@@ -164,7 +169,7 @@ class RowParallelLinearWithShardedLoRA(RowParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(

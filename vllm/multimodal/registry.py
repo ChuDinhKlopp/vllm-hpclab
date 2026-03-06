@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+
+import torch.nn as nn
 
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike, cached_tokenizer_from_config
+from vllm.transformers_utils.tokenizer import AnyTokenizer, cached_tokenizer_from_config
+from vllm.utils.collection_utils import ClassRegistry
 
 from .cache import BaseMultiModalProcessorCache
 from .processing import (
@@ -23,11 +26,10 @@ from .profiling import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
-    from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 logger = init_logger(__name__)
 
-N = TypeVar("N", bound=type["SupportsMultiModal"])
+N = TypeVar("N", bound=type[nn.Module])
 _I = TypeVar("_I", bound=BaseProcessingInfo)
 _I_co = TypeVar("_I_co", bound=BaseProcessingInfo, covariant=True)
 
@@ -92,6 +94,9 @@ class MultiModalRegistry:
     """
     A registry that dispatches data processing according to the model.
     """
+
+    def __init__(self) -> None:
+        self._processor_factories = ClassRegistry[nn.Module, _ProcessorFactories]()
 
     def _extract_mm_options(
         self,
@@ -202,7 +207,7 @@ class MultiModalRegistry:
         """
 
         def wrapper(model_cls: N) -> N:
-            if "_processor_factory" in model_cls.__dict__:
+            if self._processor_factories.contains(model_cls, strict=True):
                 logger.warning(
                     "Model class %s already has a multi-modal processor "
                     "registered to %s. It is overwritten by the new one.",
@@ -210,7 +215,7 @@ class MultiModalRegistry:
                     self,
                 )
 
-            model_cls._processor_factory = _ProcessorFactories(
+            self._processor_factories[model_cls] = _ProcessorFactories(
                 info=info,
                 dummy_inputs=dummy_inputs,
                 processor=processor,
@@ -220,32 +225,30 @@ class MultiModalRegistry:
 
         return wrapper
 
-    def _get_model_cls(self, model_config: "ModelConfig") -> "SupportsMultiModal":
+    def _get_model_cls(self, model_config: "ModelConfig"):
         # Avoid circular import
         from vllm.model_executor.model_loader import get_model_architecture
 
         model_cls, _ = get_model_architecture(model_config)
-        assert hasattr(model_cls, "_processor_factory")
-        return cast("SupportsMultiModal", model_cls)
+        return model_cls
 
     def _create_processing_ctx(
         self,
         model_config: "ModelConfig",
-        tokenizer: TokenizerLike | None = None,
+        tokenizer: AnyTokenizer | None = None,
     ) -> InputProcessingContext:
         if tokenizer is None and not model_config.skip_tokenizer_init:
             tokenizer = cached_tokenizer_from_config(model_config)
-
         return InputProcessingContext(model_config, tokenizer)
 
     def _create_processing_info(
         self,
         model_config: "ModelConfig",
         *,
-        tokenizer: TokenizerLike | None = None,
+        tokenizer: AnyTokenizer | None = None,
     ) -> BaseProcessingInfo:
         model_cls = self._get_model_cls(model_config)
-        factories = model_cls._processor_factory
+        factories = self._processor_factories[model_cls]
         ctx = self._create_processing_ctx(model_config, tokenizer)
         return factories.info(ctx)
 
@@ -253,7 +256,7 @@ class MultiModalRegistry:
         self,
         model_config: "ModelConfig",
         *,
-        tokenizer: TokenizerLike | None = None,
+        tokenizer: AnyTokenizer | None = None,
         cache: BaseMultiModalProcessorCache | None = None,
     ) -> BaseMultiModalProcessor[BaseProcessingInfo]:
         """
@@ -263,7 +266,7 @@ class MultiModalRegistry:
             raise ValueError(f"{model_config.model} is not a multimodal model")
 
         model_cls = self._get_model_cls(model_config)
-        factories = model_cls._processor_factory
+        factories = self._processor_factories[model_cls]
 
         ctx = self._create_processing_ctx(model_config, tokenizer)
 

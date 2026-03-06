@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from itertools import islice
+from typing import Any
 
 import torch
 import torch.nn as nn
 
-from vllm.attention.layer import Attention
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -188,6 +189,8 @@ class Lfm2MoeAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -216,6 +219,7 @@ class Lfm2MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
@@ -238,7 +242,8 @@ class Lfm2MoeAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
+            base=self.rope_theta,
+            rope_scaling=rope_scaling,
             is_neox_style=True,
         )
         self.attn = Attention(
@@ -288,6 +293,14 @@ class Lfm2MoeAttentionDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = Lfm2MoeAttention(
@@ -296,6 +309,8 @@ class Lfm2MoeAttentionDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
@@ -602,6 +617,7 @@ class Lfm2MoeForCausalLM(
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings",
     }
+    embedding_padding_modules = ["lm_head"]
 
     @classmethod
     def get_mamba_state_dtype_from_config(

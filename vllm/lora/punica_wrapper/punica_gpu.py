@@ -65,10 +65,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         lora_index_to_id: list[int | None],
         max_loras: int,
         vocab_size: int,
+        extra_vocab_size: int,
         **kwargs,
     ):
         self.is_prefill = mapping.is_prefill
-        self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        self._update_base_metadata(
+            mapping, lora_index_to_id, max_loras, vocab_size, extra_vocab_size
+        )
 
         # Prepare cuda kernel metadata tensors
         self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
@@ -360,8 +363,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self,
         y: torch.Tensor,
         x: torch.Tensor,
-        lora_a_stacked: tuple[torch.Tensor, ...],
-        lora_b_stacked: tuple[torch.Tensor, ...],
+        lora_a_stacked: list[torch.Tensor],
+        lora_b_stacked: list[torch.Tensor],
         topk_weights: torch.Tensor,
         sorted_token_ids: torch.Tensor,
         expert_ids: torch.Tensor,
@@ -372,8 +375,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         expand_config,
         adapter_enabled: torch.Tensor,
         mul_routed_weight=False,
-        fully_sharded: bool = False,
-        offset: int = 0,
     ):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
@@ -407,6 +408,4 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             expand_config.get("NUM_STAGES", 3),
             expand_config.get("SPLIT_K", 1),
             mul_routed_weight,
-            fully_sharded,
-            offset,
         )

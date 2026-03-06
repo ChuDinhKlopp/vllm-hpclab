@@ -153,7 +153,7 @@ class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         return type(source_layer) is ColumnParallelLinear or (
             type(source_layer) is MergedColumnParallelLinear
@@ -246,8 +246,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def set_lora(
         self,
         index: int,
-        lora_a: torch.Tensor | list[torch.Tensor],
-        lora_b: torch.Tensor | list[torch.Tensor],
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        embeddings_tensor: torch.Tensor | None,
     ):
         self.reset_lora(index)
 
@@ -272,7 +273,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         return (
             type(source_layer) is MergedColumnParallelLinear
@@ -338,7 +339,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         return type(source_layer) is QKVParallelLinear and len(packed_modules_list) == 1
 
@@ -396,7 +397,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         return type(source_layer) is QKVParallelLinear and len(packed_modules_list) == 3
 
@@ -434,7 +435,7 @@ class ColumnParallelLinearWithShardedLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(
@@ -480,7 +481,7 @@ class MergedColumnParallelLinearWithShardedLoRA(MergedColumnParallelLinearWithLo
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(
@@ -516,7 +517,7 @@ class QKVParallelLinearWithShardedLoRA(QKVParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(
@@ -565,7 +566,7 @@ class MergedQKVParallelLinearWithShardedLoRA(MergedQKVParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PretrainedConfig | None = None,
+        model_config: PretrainedConfig | None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(

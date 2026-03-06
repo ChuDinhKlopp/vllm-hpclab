@@ -9,6 +9,7 @@ import pytest_asyncio
 from ...utils import RemoteOpenAIServer
 
 # Model name constants used across tests
+MODEL_NAME_ZEPHYR = "HuggingFaceH4/zephyr-7b-beta"
 MODEL_NAME_SMOLLM = "HuggingFaceTB/SmolLM2-135M-Instruct"
 LORA_ADAPTER_NAME_SMOLLM = "jekunz/smollm-135m-lora-fineweb-faroese"
 
@@ -45,10 +46,7 @@ def basic_server_with_lora(smollm2_lora_files):
         "64",
     ]
 
-    envs = {
-        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
-        "SAGEMAKER_ENABLE_STATEFUL_SESSIONS": "True",
-    }
+    envs = {"VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"}
     with RemoteOpenAIServer(MODEL_NAME_SMOLLM, args, env_dict=envs) as remote_server:
         yield remote_server
 

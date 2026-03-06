@@ -45,8 +45,7 @@ class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
             assert topk == 1, (
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
-            # Note: do not use inplace for shared experts overlap
-            a1 = a1 * topk_weights.to(a1.dtype)
+            a1.mul_(topk_weights.to(a1.dtype))
 
         a1q, a1q_scale = moe_kernel_quantize_input(
             a1,

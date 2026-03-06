@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-import time
 from enum import Enum
 from typing import Optional
 
@@ -9,7 +8,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm import envs
-from vllm.attention.layer import Attention
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -31,7 +29,6 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
 )
 from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
     OAITritonExperts,
-    UnfusedOAITritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -40,10 +37,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    get_marlin_input_dtype,
-)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    prepare_moe_fp4_cache_for_marlin,
     prepare_moe_fp4_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -61,105 +56,6 @@ from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 logger = init_logger(__name__)
-
-# NOTE(ducct)
-import os
-from typing import List, Dict
-import torch
-EXPERT_ACTIVATION_LOG_DIR = f"/home/ducct/repos/profiling/trace-analysis/vllm-offload/scripts/log/expert_activation_pattern/{envs.LOG_SUFFIX}/"
-
-class BatchedTensorLogger:
-    def __init__(
-        self,
-        log_dir: str = "tensor_logs",
-        batch_size: int = 1296,
-        max_steps_per_file: int = None,
-        filename_format: str = "device_{device:01d}_{start:06d}_{end:06d}.pt",
-    ):
-        self.log_dir = log_dir
-        self.batch_size = batch_size
-        self.max_steps_per_file = max_steps_per_file
-        self.filename_format = filename_format
-
-        self.buffer: List[Dict] = []
-        self.current_start_step = None
-        self.current_device_id = None  # NEW
-
-        os.makedirs(log_dir, exist_ok=True)
-
-    @staticmethod
-    def _normalize_device_id(device: torch.device) -> int:
-        if device.type == "cuda":
-            return device.index
-        return 0  # CPU → device_0
-
-    def log(self, step: int, layer_id: int, tensor: torch.Tensor, device_id: torch.device, **metadata):
-        device_id = self._normalize_device_id(device_id)
-
-        # If device changes mid-buffer → flush
-        if self.current_device_id is not None and device_id != self.current_device_id:
-            self.flush()
-
-        if self.current_start_step is None:
-            self.current_start_step = step
-            self.current_device_id = device_id
-
-        entry = {
-            "step": step,
-            "layer": layer_id,
-            "tensor": tensor.cpu().clone(),
-            "shape": tuple(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "device_id": device_id,
-            **metadata,
-        }
-
-        self.buffer.append(entry)
-
-        if self.max_steps_per_file:
-            if step - self.current_start_step >= self.max_steps_per_file:
-                self.flush()
-        elif len(self.buffer) >= self.batch_size:
-            self.flush()
-
-    def flush(self):
-        if not self.buffer:
-            return
-
-        steps = [e["step"] for e in self.buffer]
-        start_step = min(steps)
-        end_step = max(steps)
-
-        device_id = self.current_device_id
-
-        filename = self.filename_format.format(
-            device=device_id,
-            start=start_step,
-            end=end_step,
-        )
-        filepath = os.path.join(self.log_dir, filename)
-
-        batch_data = {
-            "entries": self.buffer,
-            "count": len(self.buffer),
-            "step_range": (start_step, end_step),
-            "device_id": device_id,
-            "layer_ids": list({e["layer"] for e in self.buffer}),
-            "shapes": list({e["shape"] for e in self.buffer}),
-        }
-
-        torch.save(batch_data, filepath)
-        print(f"Saved {len(self.buffer)} tensors to {filename}")
-
-        self.buffer = []
-        self.current_start_step = None
-        self.current_device_id = None
-
-    def close(self):
-        if self.buffer:
-            self.flush()
-
-batched_logger = BatchedTensorLogger(log_dir=EXPERT_ACTIVATION_LOG_DIR, max_steps_per_file=10)
 
 
 # enum for mxfp4 backend
@@ -187,21 +83,8 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
     if not current_platform.is_cuda():
         return Mxfp4Backend.NONE
 
-    # If FlashInfer is not available, try either Marlin or Triton
-    triton_kernels_supported = (
-        has_triton_kernels()
-        and is_torch_equal_or_newer("2.8.0")
-        # NOTE: triton_kernels are only confirmed to work on SM90 and SM100
-        # SM110 fails with this error: https://github.com/vllm-project/vllm/issues/29317
-        # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
-        and (9, 0) <= current_platform.get_device_capability() < (11, 0)
-    )
-    if envs.VLLM_MXFP4_USE_MARLIN or not triton_kernels_supported:
-        logger.info_once("[get_mxfp4_backend_with_lora] Using Marlin backend")
-        return Mxfp4Backend.MARLIN
-
-    logger.info_once("[get_mxfp4_backend_with_lora] Using Triton backend")
-    return Mxfp4Backend.TRITON
+    logger.info_once("[get_mxfp4_backend_with_lora] Using Marlin backend")
+    return Mxfp4Backend.MARLIN
 
 
 def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
@@ -250,15 +133,12 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             )
 
         # If FlashInfer is not available, try either Marlin or Triton
-        triton_kernels_supported = (
-            has_triton_kernels()
-            and is_torch_equal_or_newer("2.8.0")
-            # NOTE: triton_kernels are only confirmed to work on SM90 and SM100
-            # SM110 fails with this error: https://github.com/vllm-project/vllm/issues/29317
-            # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
-            and (9, 0) <= current_platform.get_device_capability() < (11, 0)
-        )
-        if envs.VLLM_MXFP4_USE_MARLIN or not triton_kernels_supported:
+        if (
+            envs.VLLM_MXFP4_USE_MARLIN
+            or current_platform.get_device_capability()[0] < 9
+            or not has_triton_kernels()
+            or not is_torch_equal_or_newer("2.8.0")
+        ):
             logger.info_once("Using Marlin backend")
             return Mxfp4Backend.MARLIN
         else:
@@ -302,6 +182,8 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from vllm.attention.layer import Attention  # Avoid circular import
+
         if isinstance(layer, LinearBase):
             if self.ignored_layers and is_layer_skipped(
                 prefix=prefix,
@@ -312,25 +194,21 @@ class Mxfp4Config(QuantizationConfig):
             # TODO: Add support for MXFP4 Linear Method.
             # MXFP4 LinearMethod is available in AMD-Quark, refer to that implementation
             # if you are interested in enabling MXFP4 here.
-            logger.debug_once(
+            logger.warning_once(
                 "MXFP4 linear layer is not implemented - falling back to "
-                "UnquantizedLinearMethod.",
-                scope="local",
+                "UnquantizedLinearMethod."
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if current_platform.is_xpu():
                 return IpexMxfp4MoEMethod(layer.moe_config)
             else:
-                quant_method = Mxfp4MoEMethod(layer.moe_config)
-                quant_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
-                return quant_method
+                return Mxfp4MoEMethod(layer.moe_config)
         elif isinstance(layer, Attention):
             # TODO: Add support for MXFP4 Attention.
-            logger.debug_once(
+            logger.warning_once(
                 "MXFP4 attention layer is not implemented. "
-                "Skipping quantization for this layer.",
-                scope="local",
+                "Skipping quantization for this layer."
             )
         return None
 
@@ -338,9 +216,10 @@ class Mxfp4Config(QuantizationConfig):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
-        self.mxfp4_backend = get_mxfp4_backend(moe.is_lora_enabled)
-
+        # NOTE(ducct): add attr
         self.marlin_input_dtype = None
+
+        self.mxfp4_backend = get_mxfp4_backend(moe.is_lora_enabled)
         self.use_marlin = self.mxfp4_backend == Mxfp4Backend.MARLIN
         self.max_capture_size = (
             get_current_vllm_config().compilation_config.max_cudagraph_capture_size
@@ -352,7 +231,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "Please check your environment and try again."
         )
         self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
-        self.expert_cache = None
 
     def create_weights(
         self,
@@ -505,60 +383,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_bias", w2_bias)
         set_weight_attrs(w2_bias, extra_weight_attrs)
 
-        # NOTE(ducct): register expert cache params
-        # NOTE(ducct): initialize expert cache
-        layer.expert_cache.create_cache(
-            intermediate_size_per_partition_after_pad, 
-            hidden_size, 
-            mxfp4_block,
-            weight_dtype,
-            scale_dtype,
-        )
-        # ping buffer
-        layer.register_parameter("expert_cache_ping_w13_weight", layer.expert_cache.ping_buffer.w13_weight)
-        if not hasattr(layer.expert_cache.ping_buffer.w13_weight, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w13_weight, extra_weight_attrs)
-        layer.register_parameter("expert_cache_ping_w13_weight_scale", layer.expert_cache.ping_buffer.w13_weight_scale)
-        if not hasattr(layer.expert_cache.ping_buffer.w13_weight_scale, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w13_weight_scale, extra_weight_attrs)
-        layer.register_parameter("expert_cache_ping_w13_bias", layer.expert_cache.ping_buffer.w13_bias)
-        if not hasattr(layer.expert_cache.ping_buffer.w13_bias, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w13_bias, extra_weight_attrs)
-        layer.register_parameter("expert_cache_ping_w2_weight", layer.expert_cache.ping_buffer.w2_weight)
-        if not hasattr(layer.expert_cache.ping_buffer.w2_weight, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w2_weight, extra_weight_attrs)
-        layer.register_parameter("expert_cache_ping_w2_weight_scale", layer.expert_cache.ping_buffer.w2_weight_scale)
-        if not hasattr(layer.expert_cache.ping_buffer.w2_weight_scale, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w2_weight_scale, extra_weight_attrs)
-        layer.register_parameter("expert_cache_ping_w2_bias", layer.expert_cache.ping_buffer.w2_bias)
-        if not hasattr(layer.expert_cache.ping_buffer.w2_bias, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.ping_buffer.w2_bias, extra_weight_attrs)
-
-        # pong buffer
-        layer.register_parameter("expert_cache_pong_w13_weight", layer.expert_cache.pong_buffer.w13_weight)
-        if not hasattr(layer.expert_cache.pong_buffer.w13_weight, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w13_weight, extra_weight_attrs)
-        layer.register_parameter("expert_cache_pong_w13_weight_scale", layer.expert_cache.pong_buffer.w13_weight_scale)
-        if not hasattr(layer.expert_cache.pong_buffer.w13_weight_scale, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w13_weight_scale, extra_weight_attrs)
-        layer.register_parameter("expert_cache_pong_w13_bias", layer.expert_cache.pong_buffer.w13_bias)
-        if not hasattr(layer.expert_cache.pong_buffer.w13_bias, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w13_bias, extra_weight_attrs)
-        layer.register_parameter("expert_cache_pong_w2_weight", layer.expert_cache.pong_buffer.w2_weight)
-        if not hasattr(layer.expert_cache.pong_buffer.w2_weight, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w2_weight, extra_weight_attrs)
-        layer.register_parameter("expert_cache_pong_w2_weight_scale", layer.expert_cache.pong_buffer.w2_weight_scale)
-        if not hasattr(layer.expert_cache.pong_buffer.w2_weight_scale, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w2_weight_scale, extra_weight_attrs)
-        layer.register_parameter("expert_cache_pong_w2_bias", layer.expert_cache.pong_buffer.w2_bias)
-        if not hasattr(layer.expert_cache.pong_buffer.w2_bias, "weight_loader"):
-            set_weight_attrs(layer.expert_cache.pong_buffer.w2_bias, extra_weight_attrs)
-
-
-
     def process_weights_after_loading(self, layer):
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
-            prepare_moe_fp4_layer_for_marlin(layer, input_dtype=self.marlin_input_dtype)
+            # NOTE(ducct): add prepare_moe_fp4_cache_for_marlin
+            prepare_moe_fp4_cache_for_marlin(layer, input_dtype=self.marlin_input_dtype)
+
+            prepare_moe_fp4_layer_for_marlin(layer)
         elif (
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
             or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
@@ -932,10 +762,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.w13_weight = w13_weight
             self.w2_weight = w2_weight
-            del layer.w13_weight
-            del layer.w2_weight
-            layer.w13_weight = w13_weight
-            layer.w2_weight = w2_weight
+            layer.w13_weight = Parameter(w13_weight.storage.data, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight.storage.data, requires_grad=False)
         else:
             raise ValueError(f"Unsupported backend: {self.mxfp4_backend}")
 
@@ -1027,8 +855,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             elif self.mxfp4_backend == Mxfp4Backend.MARLIN:
                 return MarlinExperts(self.moe_quant_config)
             elif self.mxfp4_backend == Mxfp4Backend.TRITON:
-                if self.moe.is_lora_enabled:
-                    return UnfusedOAITritonExperts(self.moe_quant_config)
                 return OAITritonExperts(self.moe_quant_config)
             else:
                 raise NotImplementedError(
@@ -1041,7 +867,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
@@ -1065,42 +891,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if enable_eplb:
             raise NotImplementedError("EPLB is not supported for mxfp4")
 
-        # NOTE(ducct): diagnostic print to verify device placement once
-        if not hasattr(layer, "_expert_cache_device_debugged"):
-            layer._expert_cache_device_debugged = True
-            try:
-                print("=== MoE device debug ===")
-                print("w13_weight:", layer.w13_weight.device, layer.w13_weight.dtype, layer.w13_weight.shape)
-                print("w2_weight:", layer.w2_weight.device, layer.w2_weight.dtype, layer.w2_weight.shape)
-                print(
-                    "cache ping w13:",
-                    layer.expert_cache.ping_buffer.w13_weight.device,
-                    layer.expert_cache.ping_buffer.w13_weight.dtype,
-                    layer.expert_cache.ping_buffer.w13_weight.shape,
-                )
-                print(
-                    "cache pong w13:",
-                    layer.expert_cache.pong_buffer.w13_weight.device,
-                    layer.expert_cache.pong_buffer.w13_weight.dtype,
-                    layer.expert_cache.pong_buffer.w13_weight.shape,
-                )
-            except Exception as exc:
-                print(f"MoE device debug failed: {exc}")
-
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
-            topk_weights, topk_ids, _ = layer.select_experts(
+            topk_weights, topk_ids, _ = FusedMoE.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
             )
             # TODO(ducct): checking if selected experts (topk_ids) exist in the current layer's expert cache. The mapper is on CPU -> need to:
             # 1. Get the unique set of topk_ids -> unique_expert_ids: done
             active_cache = layer.expert_cache.get_active_buffer()
             inactive_cache = layer.expert_cache.get_inactive_buffer()
-            print(f"active_buffer in mlp: {layer.expert_cache.active_buffer}")
+            # print(f"active_buffer in mlp: {layer.expert_cache.active_buffer}")
             if layer.expert_cache.active_buffer == "ping":
                 cached_expert_ids = layer.cached_expert_ids_ping
             else:
                 cached_expert_ids = layer.cached_expert_ids_pong
+            if cached_expert_ids is None or cached_expert_ids.numel() == 0:
+                cached_expert_ids = unique_selected_ids
+                if layer.expert_cache.active_buffer == "ping":
+                    layer.cached_expert_ids_ping = cached_expert_ids.to(x.device)
+                else:
+                    layer.cached_expert_ids_pong = cached_expert_ids.to(x.device)
             print(f"layer {envs.LAYER_ID}: cached_expert_ids = {cached_expert_ids}")
             print(f"layer {envs.LAYER_ID}: cached_expert_ids.device = {cached_expert_ids.device}")
             print(f"cached_expert_ids.shape: {cached_expert_ids.shape}")
@@ -1116,44 +935,65 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if not is_subset:
                 missing_values = unique_selected_ids[~expert_mask]
                 cached_expert_ids = unique_selected_ids
-                print(f"No, it is not a subset")
-                print(f"Values in topk_ids that are missing: {missing_values}")
+                # print(f"No, it is not a subset")
+                # print(f"Values in topk_ids that are missing: {missing_values}")
                 # 4. if there is missing ids in predicted ids, fetch to GPU on demand
                 # TODO(ducct): fetch on-demand missing experts into the cache. 
                 active_cache.fetch_on_demand(layer, missing_values.to("cpu"))
+                if layer.expert_cache.active_buffer == "ping":
+                    layer.cached_expert_ids_ping = cached_expert_ids.to(x.device)
+                else:
+                    layer.cached_expert_ids_pong = cached_expert_ids.to(x.device)
             else:
                 print(f"Yes, it is a subset")
 
             print(f"cached_expert_ids after fetch on-demand: {cached_expert_ids}")
 
-            # NOTE(ducct)
-            if envs.ENABLE_EXPERT_ACTIVATION_PROFILE and envs.STEP_NUM != 0:
-                device_id = x.device if x.is_cuda else torch.device("cpu")
-                batched_logger.log(step=envs.STEP_NUM, layer_id=envs.LAYER_ID, tensor=topk_ids, device_id=device_id)
+            # Map expert IDs -> cache slot indices
+            num_experts = getattr(layer, "num_experts", None) or layer.global_num_experts
+            cached_expert_ids_dev = cached_expert_ids.to(device=topk_ids.device, dtype=torch.long)
+            lookup = torch.full(
+                (num_experts,),
+                -1,
+                device=topk_ids.device,
+                dtype=torch.int32,
+            )
+            lookup[cached_expert_ids_dev] = torch.arange(
+                cached_expert_ids_dev.numel(),
+                device=topk_ids.device,
+                dtype=torch.int32,
+            )
+            cached_topk_ids = lookup[topk_ids]
+            if (cached_topk_ids < 0).any():
+                raise RuntimeError("topk_ids contains experts not present in cache.")
 
-            # NOTE(ducct)
-            with torch.profiler.record_function("ducct::fused_marlin_moe"):
-                out = fused_marlin_moe(
-                    x,
-                    active_cache.w13_weight,          # NOTE(ducct)
-                    active_cache.w2_weight,           # NOTE(ducct)
-                    active_cache.w13_bias,            # NOTE(ducct)
-                    active_cache.w2_bias,             # NOTE(ducct)
-                    active_cache.w13_weight_scale,    # NOTE(ducct)
-                    active_cache.w2_weight_scale,     # NOTE(ducct)
-                    router_logits,
-                    topk_weights,
-                    topk_ids,
-                    global_scale1=None,
-                    global_scale2=None,
-                    quant_type_id=scalar_types.float4_e2m1f.id,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                    global_num_experts=layer.global_num_experts,
-                    activation=activation,
-                    expert_map=expert_map,
-                    input_dtype=self.marlin_input_dtype,
-                )
 
+            out = fused_marlin_moe(
+                x,
+                active_cache.w13_weight,          # NOTE(ducct)
+                active_cache.w2_weight,           # NOTE(ducct)
+                active_cache.w13_bias,            # NOTE(ducct)
+                active_cache.w2_bias,             # NOTE(ducct)
+                active_cache.w13_weight_scale,    # NOTE(ducct)
+                active_cache.w2_weight_scale,     # NOTE(ducct)
+                # layer.w13_weight,
+                # layer.w2_weight,
+                # layer.w13_bias,
+                # layer.w2_bias,
+                # layer.w13_weight_scale,
+                # layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                cached_topk_ids,
+                # topk_ids,
+                global_scale1=None,
+                global_scale2=None,
+                quant_type_id=scalar_types.float4_e2m1f.id,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                activation=activation,
+                expert_map=expert_map,
+            )
             # NOTE(ducct): Check if inactive buffer is available (done prefetching).
             # If not available yet, wait on the prefetch event before flipping.
             if not inactive_cache.is_avail():
@@ -1163,7 +1003,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.expert_cache.flip_active_buffer()
 
             return out
-            
 
         assert _can_support_mxfp4(
             use_grouped_topk,
@@ -1233,12 +1072,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         ):
             from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
 
-            topk_weights, topk_ids, _ = layer.select_experts(
+            topk_weights, topk_ids, _ = FusedMoE.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
             )
-
-            # TODO(ducct): checking if selected experts (topk_ids) exist in the current layer's expert cache
 
             # Backend-specific preparation
             if self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS:
@@ -1305,8 +1150,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return triton_kernel_moe_forward(
                 hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=self.w13_weight,
+                w2=self.w2_weight,
                 gating_output=router_logits,
                 topk=top_k,
                 renormalize=renormalize,

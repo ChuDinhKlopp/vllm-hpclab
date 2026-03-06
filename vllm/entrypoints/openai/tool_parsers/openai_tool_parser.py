@@ -18,15 +18,15 @@ from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.tokenizers import TokenizerLike
+    from vllm.transformers_utils.tokenizer import AnyTokenizer
 else:
-    TokenizerLike = object
+    AnyTokenizer = object
 
 logger = init_logger(__name__)
 
 
 class OpenAIToolParser(ToolParser):
-    def __init__(self, tokenizer: "TokenizerLike"):
+    def __init__(self, tokenizer: "AnyTokenizer"):
         super().__init__(tokenizer)
 
     def extract_tool_calls(

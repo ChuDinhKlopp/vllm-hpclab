@@ -10,8 +10,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-from vllm.attention.backends.abstract import AttentionMetadata
-from vllm.attention.layer import Attention
+from vllm.attention import Attention, AttentionBackend, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -217,7 +216,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
     @property
     def mamba_type(self) -> str:
-        return "gdn_attention"
+        return "linear_attention"
+
+    def get_attn_backend(self) -> type["AttentionBackend"]:
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+
+        return GDNAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
@@ -749,7 +753,8 @@ class Qwen3NextAttention(nn.Module):
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
+            base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
             partial_rotary_factor=config.partial_rotary_factor,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
@@ -1149,8 +1154,8 @@ class QwenNextMixtureOfExperts(MixtureOfExperts):
                 example_moe = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
 
-        if example_moe is None:
-            raise RuntimeError("No Qwen3Next layer found in the model.layers.")
+            if example_moe is None:
+                raise RuntimeError("No Qwen3Next layer found in the model.layers.")
 
         # Set MoE hyperparameters
         self.num_moe_layers = len(self.moe_layers)

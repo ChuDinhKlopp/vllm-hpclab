@@ -19,12 +19,12 @@ if TYPE_CHECKING:
         DeltaMessage,
         ResponsesRequest,
     )
-    from vllm.tokenizers import TokenizerLike
+    from vllm.transformers_utils.tokenizer import AnyTokenizer
 else:
     ChatCompletionRequest = Any
     DeltaMessage = Any
     ResponsesRequest = Any
-    TokenizerLike = Any
+    AnyTokenizer = Any
 
 logger = init_logger(__name__)
 
@@ -37,7 +37,7 @@ class ReasoningParser:
     It is used to extract reasoning content from the model output.
     """
 
-    def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
+    def __init__(self, tokenizer: AnyTokenizer, *args, **kwargs):
         self.model_tokenizer = tokenizer
 
     @cached_property

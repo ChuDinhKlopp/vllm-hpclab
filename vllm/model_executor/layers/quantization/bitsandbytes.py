@@ -495,7 +495,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
@@ -518,11 +518,25 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.fused_moe import fused_experts
 
-        topk_weights, topk_ids, _ = layer.select_experts(
+        if enable_eplb:
+            raise NotImplementedError(
+                "EPLB not supported for `BitsAndBytesMoEMethod` yet."
+            )
+
+        topk_weights, topk_ids, _ = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            indices_type=self.topk_indices_dtype,
         )
-        # TODO(bnell): Do these need to be called on the hot path?
         if self.quant_config.load_in_8bit:
             w13, w2 = self._apply_8bit_dequant(layer)
         else:

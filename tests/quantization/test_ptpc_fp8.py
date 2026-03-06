@@ -38,7 +38,6 @@ def test_ptpc_fp8_rocm(vllm_runner, dtype: str, kv_cache_dtype: str) -> None:
             "facebook/opt-125m",
             dtype=dtype,
             quantization="ptpc_fp8",
-            enforce_eager=True,
             kv_cache_dtype=kv_cache_dtype,
         )
     except AssertionError as e:
@@ -66,5 +65,5 @@ def test_ptpc_fp8_rocm(vllm_runner, dtype: str, kv_cache_dtype: str) -> None:
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=4)
+        output = llm.generate_greedy("Hello my name is", max_tokens=20)
         assert output

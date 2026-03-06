@@ -4,9 +4,9 @@
 import pytest
 from transformers import AutoTokenizer
 
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 
 @pytest.fixture(scope="function")
-def default_tokenizer() -> TokenizerLike:
+def default_tokenizer() -> AnyTokenizer:
     return AutoTokenizer.from_pretrained("gpt2")

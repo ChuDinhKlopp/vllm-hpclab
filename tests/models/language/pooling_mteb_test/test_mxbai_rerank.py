@@ -70,9 +70,8 @@ class MxbaiRerankerHfRunner(HfRunner):
             return scores
 
         scores = []
-        for query, doc, *_ in prompts:
-            pairs = [(query, doc)]
-            inputs = process_inputs(pairs)
+        for prompt in prompts:
+            inputs = process_inputs([prompt])
             score = compute_logits(inputs)
             scores.append(score[0].item())
         return torch.Tensor(scores)

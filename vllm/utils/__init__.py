@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
+
 _DEPRECATED_MAPPINGS = {
     "cprofile": "profiling",
     "cprofile_context": "profiling",
@@ -35,11 +37,25 @@ def __dir__() -> list[str]:
     return sorted(list(globals().keys()) + list(_DEPRECATED_MAPPINGS.keys()))
 
 
-MASK_64_BITS = (1 << 64) - 1
+logger = init_logger(__name__)
+
+# Constants related to forcing the attention backend selection
+
+# String name of register which may be set in order to
+# force auto-selection of attention backend by Attention
+# wrapper
+STR_BACKEND_ENV_VAR: str = "VLLM_ATTENTION_BACKEND"
+
+# Possible string values of STR_BACKEND_ENV_VAR
+# register, corresponding to possible backends
+STR_FLASHINFER_ATTN_VAL: str = "FLASHINFER"
+STR_XFORMERS_ATTN_VAL: str = "XFORMERS"
+STR_FLASH_ATTN_VAL: str = "FLASH_ATTN"
+STR_INVALID_VAL: str = "INVALID"
 
 
 def random_uuid() -> str:
-    return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
+    return str(uuid.uuid4().hex)
 
 
 def length_from_prompt_token_ids_or_embeds(

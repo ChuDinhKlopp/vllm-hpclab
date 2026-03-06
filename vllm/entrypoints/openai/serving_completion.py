@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
-from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
@@ -216,7 +216,6 @@ class OpenAIServingCompletion(OpenAIServing):
                         request_id=request_id,
                         params=sampling_params,
                         lora_request=lora_request,
-                        trace_headers=trace_headers,
                     )
                 else:
                     engine_request, tokenization_kwargs = await self._process_inputs(
@@ -250,8 +249,14 @@ class OpenAIServingCompletion(OpenAIServing):
         model_name = self.models.model_name(lora_request)
         num_prompts = len(engine_prompts)
 
-        # We do not stream the results when using beam search.
-        stream = request.stream and not request.use_beam_search
+        # Similar to the OpenAI API, when n != best_of, we do not stream the
+        # results. Noting that best_of is only supported in V0. In addition,
+        # we do not stream the results when use beam search.
+        stream = (
+            request.stream
+            and (request.best_of is None or request.n == request.best_of)
+            and not request.use_beam_search
+        )
 
         # Streaming response
         if stream:
@@ -326,7 +331,7 @@ class OpenAIServingCompletion(OpenAIServing):
         created_time: int,
         model_name: str,
         num_prompts: int,
-        tokenizer: TokenizerLike | None,
+        tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> AsyncGenerator[str, None]:
         num_choices = 1 if request.n is None else request.n
@@ -511,7 +516,7 @@ class OpenAIServingCompletion(OpenAIServing):
         request_id: str,
         created_time: int,
         model_name: str,
-        tokenizer: TokenizerLike | None,
+        tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> CompletionResponse:
         choices: list[CompletionResponseChoice] = []
@@ -622,7 +627,7 @@ class OpenAIServingCompletion(OpenAIServing):
         token_ids: GenericSequence[int],
         top_logprobs: GenericSequence[dict[int, Logprob] | None],
         num_output_top_logprobs: int,
-        tokenizer: TokenizerLike | None,
+        tokenizer: AnyTokenizer,
         initial_text_offset: int = 0,
         return_as_token_id: bool | None = None,
     ) -> CompletionLogProbs:
@@ -642,15 +647,9 @@ class OpenAIServingCompletion(OpenAIServing):
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
+                token = tokenizer.decode(token_id)
                 if should_return_as_token_id:
                     token = f"token_id:{token_id}"
-                else:
-                    if tokenizer is None:
-                        raise ValueError(
-                            "Unable to get tokenizer because `skip_tokenizer_init=True`"
-                        )
-
-                    token = tokenizer.decode(token_id)
 
                 out_tokens.append(token)
                 out_token_logprobs.append(None)

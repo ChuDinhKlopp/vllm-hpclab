@@ -24,7 +24,6 @@ from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul, get_act_fn
-from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -79,7 +78,7 @@ class GLMVImagePixelInputs(TensorSchema):
 class EVA2CLIPPatchEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.proj = Conv2dLayer(
+        self.proj = nn.Conv2d(
             config.in_channels,
             config.hidden_size,
             kernel_size=config.patch_size,
@@ -334,7 +333,7 @@ class EVA2CLIPModel(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear_proj",
         )
-        self.conv = Conv2dLayer(
+        self.conv = nn.Conv2d(
             in_channels=vision_config.hidden_size,
             out_channels=config.hidden_size,
             kernel_size=2,

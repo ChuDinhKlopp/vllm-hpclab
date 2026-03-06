@@ -6,15 +6,8 @@ import random
 
 import pytest
 import torch
-from utils import (
-    BACKENDS,
-    _extract_step_logprobs,
-    _random_prompt,
-    resolve_model_name,
-    skip_unsupported,
-)
+from utils import _extract_step_logprobs, _random_prompt, skip_unsupported
 
-import vllm.model_executor.layers.batch_invariant as batch_invariant
 from vllm import LLM, SamplingParams
 
 
@@ -22,7 +15,7 @@ from vllm import LLM, SamplingParams
 @pytest.mark.timeout(1000)
 @pytest.mark.parametrize(
     "backend",
-    BACKENDS,
+    ["FLASH_ATTN", "FLASHINFER", "FLASH_ATTN_MLA", "FLASHINFER_MLA", "TRITON_MLA"],
 )
 def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
     backend, monkeypatch: pytest.MonkeyPatch
@@ -54,7 +47,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
     monkeypatch.setenv("VLLM_ATTENTION_BACKEND", backend)
     # Allow overrides from environment (useful for CI tuning)
     # "facebook/opt-125m" is too small, doesn't reliably test determinism
-    model = resolve_model_name(backend)
+    model = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B")
     num_trials = int(os.getenv("VLLM_NEEDLE_TRIALS", "5"))
     max_batch_size = int(os.getenv("VLLM_NEEDLE_BATCH_SIZE", "128"))
     min_random_prompt = int(os.getenv("VLLM_MIN_PROMPT", "1024"))
@@ -157,8 +150,9 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
 @skip_unsupported
 @pytest.mark.parametrize(
     "backend",
-    BACKENDS,
+    ["FLASH_ATTN", "FLASHINFER", "FLASH_ATTN_MLA", "FLASHINFER_MLA", "TRITON_MLA"],
 )
+@pytest.mark.forked
 def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
     backend, monkeypatch: pytest.MonkeyPatch
 ):
@@ -166,7 +160,7 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
 
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
-    model_name = resolve_model_name(backend)
+    model_name = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B")
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
     # For batch invariance, disable custom all-reduce to ensure deterministic
@@ -189,7 +183,6 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
         max_num_seqs=32,
         max_model_len=8192,
         dtype="bfloat16",  # not everything is supported
-        gpu_memory_utilization=0.9,
     )
 
     # Use more realistic prompts for better token generation
@@ -376,7 +369,7 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
 @skip_unsupported
 @pytest.mark.parametrize(
     "backend",
-    BACKENDS,
+    ["FLASH_ATTN", "FLASHINFER", "FLASH_ATTN_MLA", "FLASHINFER_MLA", "TRITON_MLA"],
 )
 def test_simple_generation(backend, monkeypatch: pytest.MonkeyPatch):
     """
@@ -384,7 +377,7 @@ def test_simple_generation(backend, monkeypatch: pytest.MonkeyPatch):
     Useful for quick smoke testing and debugging.
     """
     monkeypatch.setenv("VLLM_ATTENTION_BACKEND", backend)
-    model = resolve_model_name(backend)
+    model = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B")
 
     llm = LLM(
         model=model,
@@ -426,8 +419,9 @@ def test_simple_generation(backend, monkeypatch: pytest.MonkeyPatch):
 @skip_unsupported
 @pytest.mark.parametrize(
     "backend",
-    BACKENDS,
+    ["FLASH_ATTN", "FLASHINFER", "FLASH_ATTN_MLA", "FLASHINFER_MLA", "TRITON_MLA"],
 )
+@pytest.mark.forked
 def test_logprobs_without_batch_invariance_should_fail(
     backend, monkeypatch: pytest.MonkeyPatch
 ):
@@ -444,10 +438,10 @@ def test_logprobs_without_batch_invariance_should_fail(
 
     # CRITICAL: Disable batch invariance for this test
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    monkeypatch.setattr(batch_invariant, "VLLM_BATCH_INVARIANT", False)
+
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
-    model_name = resolve_model_name(backend)
+    model_name = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B")
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
     print(f"\n{'=' * 80}")
@@ -644,6 +638,7 @@ def test_logprobs_without_batch_invariance_should_fail(
 
 @skip_unsupported
 @pytest.mark.parametrize("backend", ["FLASH_ATTN"])
+@pytest.mark.forked
 def test_decode_logprobs_match_prefill_logprobs(
     backend, monkeypatch: pytest.MonkeyPatch
 ):
@@ -664,7 +659,7 @@ def test_decode_logprobs_match_prefill_logprobs(
 
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
-    model_name = resolve_model_name(backend)
+    model_name = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3-1.7B")
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
     from vllm.model_executor.layers.batch_invariant import (

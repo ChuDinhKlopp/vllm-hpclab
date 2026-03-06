@@ -3,6 +3,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 from torch import Tensor
 
 from vllm.platforms import current_platform
@@ -14,8 +15,6 @@ if not current_platform.has_device_capability(100):
         reason="FlashInfer MLA Requires compute capability of 10 or above.",
         allow_module_level=True,
     )
-else:
-    from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
 
 def ref_mla(

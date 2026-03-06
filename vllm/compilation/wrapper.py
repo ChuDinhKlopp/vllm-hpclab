@@ -6,7 +6,6 @@ import sys
 from abc import abstractmethod
 from contextlib import contextmanager
 from types import CodeType
-from typing import Any
 
 import torch
 import torch._C._dynamo.guards
@@ -86,12 +85,6 @@ class TorchCompileWithNoGuardsWrapper:
     since we drop all guards.
     """
 
-    def check_invariants_and_forward(self, *args, **kwargs):
-        assert hasattr(self, "_check_shape_invariants")
-        self._check_shape_invariants(*args, **kwargs)
-
-        return self.forward(*args, **kwargs)
-
     def __init__(self):
         self.compiled = False
 
@@ -111,21 +104,6 @@ class TorchCompileWithNoGuardsWrapper:
             # Drop all the guards.
             options["guard_filter_fn"] = lambda x: [False for _ in x]
 
-        # Validate that unbacked dynamic shapes require VLLM_USE_BYTECODE_HOOK=False
-        from vllm.compilation.decorators import DynamicShapesType
-
-        ds_type = vllm_config.compilation_config.dynamic_shapes_config.type
-        compiled_ptr: Any = self.forward
-        if ds_type == DynamicShapesType.UNBACKED:
-            if envs.VLLM_USE_BYTECODE_HOOK:
-                # reason is that bytecode does this hack torch._dynamo.eval_frame.
-                # remove_from_cache(self.original_code_object()) to force a new
-                # re-compilation.
-                raise ValueError(
-                    "UNBACKED dynamic shapes require VLLM_USE_BYTECODE_HOOK=0. "
-                )
-            compiled_ptr = self.check_invariants_and_forward
-
         if envs.VLLM_USE_AOT_COMPILE:
             if hasattr(torch._dynamo.config, "enable_aot_compile"):
                 torch._dynamo.config.enable_aot_compile = True
@@ -136,7 +114,7 @@ class TorchCompileWithNoGuardsWrapper:
                 logger.warning(msg)
 
         self._compiled_callable = torch.compile(
-            compiled_ptr,
+            self.forward,
             fullgraph=True,
             dynamic=False,
             backend=backend,
@@ -157,45 +135,24 @@ class TorchCompileWithNoGuardsWrapper:
         return self._compiled_callable.aot_compile((args, kwargs))
 
     def __call__(self, *args, **kwargs):
-        # NOTE(ducct)
-        logger.info(f"Yooo, I'm called bro")
-        # TODO: set ENABLE_NVTX=False here
-        envs.ENABLE_NVTX = False
-
         if envs.VLLM_USE_BYTECODE_HOOK:
             if (
                 self.vllm_config.compilation_config.mode
                 == CompilationMode.STOCK_TORCH_COMPILE
             ):
-                # NOTE(ducct)
-                logger.info(f"Compiled STOCK_TORCH_COMPILE")
-
                 return self._compiled_callable(*args, **kwargs)
 
             if not self._compiled_bytecode:
                 # Make sure a compilation is triggered by clearing dynamo
                 # cache.
                 torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
-                # NOTE(ducct)
-                logger.info(f"Compiled BYTECODE")
-
                 return self._compiled_callable(*args, **kwargs)
             else:
                 with self._dispatch_to_compiled_code():
-                    # NOTE(ducct)
-                    logger.info(f"No recompilation, use cached compile code")
-                    # TODO: set ENABLE_NVTX=True here
-                    envs.ENABLE_NVTX = True
-
                     return self.forward(*args, **kwargs)
         else:
             with _compilation_context():
-                # NOTE(ducct)
-                logger.info(f"Compiled context")
                 return self._compiled_callable(*args, **kwargs)
-
-        # NOTE(ducct)
-        logger.info(f"No Compilation happens")
 
     @abstractmethod
     def forward(self, *args, **kwargs): ...

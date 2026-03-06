@@ -10,7 +10,7 @@ import yaml
 from transformers import AutoTokenizer
 from pydantic import ValidationError
 
-from vllm.tokenizers.detokenizer_utils import convert_ids_list_to_tokens
+from vllm.transformers_utils.detokenizer_utils import convert_ids_list_to_tokens
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from ..utils import flat_product
@@ -27,8 +27,7 @@ def parser():
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--enable-feature", action="store_true")
     parser.add_argument("--hf-overrides", type=json.loads)
-    parser.add_argument("-cc", "--compilation-config", type=json.loads)
-    parser.add_argument("--optimization-level", type=int)
+    parser.add_argument("-O", "--compilation-config", type=json.loads)
     return parser
 
 
@@ -167,8 +166,8 @@ def test_dict_args(parser):
         "--hf-overrides.key2.key4",
         "val3",
         # Test compile config and compilation mode
-        "-cc.use_inductor_graph_partition=true",
-        "-cc.backend",
+        "-O.use_inductor=true",
+        "-O.backend",
         "custom",
         "-O1",
         # Test = sign
@@ -191,9 +190,9 @@ def test_dict_args(parser):
         "--hf_overrides.key14.key15",
         "-minus.and.dot",
         # Test array values
-        "-cc.custom_ops+",
+        "-O.custom_ops+",
         "-quant_fp8",
-        "-cc.custom_ops+=+silu_mul,-rms_norm",
+        "-O.custom_ops+=+silu_mul,-rms_norm",
     ]
     parsed_args = parser.parse_args(args)
     assert parsed_args.model_name == "something.something"
@@ -218,9 +217,9 @@ def test_dict_args(parser):
             "key15": "-minus.and.dot",
         },
     }
-    assert parsed_args.optimization_level == 1
     assert parsed_args.compilation_config == {
-        "use_inductor_graph_partition": True,
+        "mode": 1,
+        "use_inductor": True,
         "backend": "custom",
         "custom_ops": ["-quant_fp8", "+silu_mul", "-rms_norm"],
     }
@@ -234,7 +233,7 @@ def test_duplicate_dict_args(caplog_vllm, parser):
         "--hf-overrides.key1",
         "val2",
         "-O1",
-        "-cc.mode",
+        "-O.mode",
         "2",
         "-O3",
     ]
@@ -242,13 +241,12 @@ def test_duplicate_dict_args(caplog_vllm, parser):
     parsed_args = parser.parse_args(args)
     # Should be the last value
     assert parsed_args.hf_overrides == {"key1": "val2"}
-    assert parsed_args.optimization_level == 3
-    assert parsed_args.compilation_config == {"mode": 2}
+    assert parsed_args.compilation_config == {"mode": 3}
 
     assert len(caplog_vllm.records) == 1
     assert "duplicate" in caplog_vllm.text
     assert "--hf-overrides.key1" in caplog_vllm.text
-    assert "--optimization-level" in caplog_vllm.text
+    assert "-O.mode" in caplog_vllm.text
 
 
 def test_model_specification(
@@ -380,29 +378,29 @@ def test_load_config_file(tmp_path):
 
 
 def test_compilation_mode_string_values(parser):
-    """Test that -cc.mode accepts both integer and string mode values."""
-    args = parser.parse_args(["-cc.mode", "0"])
+    """Test that -O.mode accepts both integer and string mode values."""
+    args = parser.parse_args(["-O.mode", "0"])
     assert args.compilation_config == {"mode": 0}
 
     args = parser.parse_args(["-O3"])
-    assert args.optimization_level == 3
+    assert args.compilation_config == {"mode": 3}
 
-    args = parser.parse_args(["-cc.mode=NONE"])
+    args = parser.parse_args(["-O.mode=NONE"])
     assert args.compilation_config == {"mode": "NONE"}
 
-    args = parser.parse_args(["-cc.mode", "STOCK_TORCH_COMPILE"])
+    args = parser.parse_args(["-O.mode", "STOCK_TORCH_COMPILE"])
     assert args.compilation_config == {"mode": "STOCK_TORCH_COMPILE"}
 
-    args = parser.parse_args(["-cc.mode=DYNAMO_TRACE_ONCE"])
+    args = parser.parse_args(["-O.mode=DYNAMO_TRACE_ONCE"])
     assert args.compilation_config == {"mode": "DYNAMO_TRACE_ONCE"}
 
-    args = parser.parse_args(["-cc.mode", "VLLM_COMPILE"])
+    args = parser.parse_args(["-O.mode", "VLLM_COMPILE"])
     assert args.compilation_config == {"mode": "VLLM_COMPILE"}
 
-    args = parser.parse_args(["-cc.mode=none"])
+    args = parser.parse_args(["-O.mode=none"])
     assert args.compilation_config == {"mode": "none"}
 
-    args = parser.parse_args(["-cc.mode=vllm_compile"])
+    args = parser.parse_args(["-O.mode=vllm_compile"])
     assert args.compilation_config == {"mode": "vllm_compile"}
 
 
@@ -458,25 +456,3 @@ def test_flat_product():
         (3, 4, "a", 5, 6),
         (3, 4, "b", 5, 6),
     ]
-
-
-def test_o_legacy_syntax_deprecation(caplog_vllm):
-    """Test that -O.* dotted syntax emits warnings and converts correctly to -cc syntax."""
-    parser = FlexibleArgumentParser()
-    parser.add_argument("-cc", "--compilation-config", type=json.loads)
-
-    # Test that -O.backend gets converted correctly AND emits warning
-    args = parser.parse_args(["-O.backend=eager"])
-    assert args.compilation_config == {"backend": "eager"}
-
-    # Check that deprecation warning was logged
-    assert len(caplog_vllm.records) >= 1
-    assert (
-        "The -O.* dotted syntax for --compilation-config is deprecated"
-        in caplog_vllm.text
-    )
-
-    # Test that -O.mode gets converted correctly
-    # Note: warning_once won't emit again in same session
-    args = parser.parse_args(["-O.mode=2"])
-    assert args.compilation_config == {"mode": 2}

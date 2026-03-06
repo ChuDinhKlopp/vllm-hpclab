@@ -11,11 +11,12 @@ import random
 
 from vllm import LLM, SamplingParams
 
-# Either:
-## Turn off multiprocessing to make the scheduling deterministic, or
+# V1 only: Turn off multiprocessing to make the scheduling deterministic.
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-## Enable batch invariance to get consistent results regardless of scheduling.
-os.environ["VLLM_BATCH_INVARIANT"] = "1"
+
+# V0 only: Set the global seed. The default seed is None, which is
+# not reproducible.
+SEED = 42
 
 prompts = [
     "Hello, my name is",
@@ -27,7 +28,7 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 
 def main():
-    llm = LLM(model="facebook/opt-125m")
+    llm = LLM(model="facebook/opt-125m", seed=SEED)
     outputs = llm.generate(prompts, sampling_params)
     print("-" * 50)
     for output in outputs:
