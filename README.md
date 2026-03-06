@@ -1,5 +1,5 @@
 ## About
-This fork implements **partial experts prefetching** for vLLM.
+This fork implements **expert-granularity offloading** and **partial experts prefetching** for vLLM.
 
 ## Supported Models
 This repository currently supports the following **GPT-OSS** models:
@@ -10,7 +10,7 @@ This repository currently supports the following **GPT-OSS** models:
 
 ### 1. Clone the repository
 ```bash
-git clone <repo-url>
+git clone https://github.com/ChuDinhKlopp/vllm-hpclab.git
 cd vllm-hpclab
 ```
 
