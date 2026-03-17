@@ -600,6 +600,8 @@ class FusedMoE(CustomOp):
             "params_dtype": params_dtype,
             "weight_loader": self.weight_loader,
             "global_num_experts": self.global_num_experts,
+            # NOTE(ducct): add cached_weight_loader
+            "cached_weight_loader": self.cached_weight_loader,
         }
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in (
@@ -608,6 +610,12 @@ class FusedMoE(CustomOp):
             "CompressedTensorsWNA16MoEMethod",
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
+
+        # NOTE(ducct): per-layer cached expert ids for ping/pong buffers
+        self.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32)
+        # print(f"self.cached_expert_ids_ping.device: {self.cached_expert_ids_ping.device}")
+        self.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32)
+        # print(f"self.cached_expert_ids_pong.device: {self.cached_expert_ids_pong.device}")
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
@@ -1135,6 +1143,171 @@ class FusedMoE(CustomOp):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
+            quant_method = getattr(param, "quant_method", None)
+            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+            elif quant_method in [
+                FusedMoeWeightScaleSupported.GROUP.value,
+                FusedMoeWeightScaleSupported.BLOCK.value,
+            ]:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    load_full_w2=getattr(param, "load_full_w2", False),
+                )
+            elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=expert_id,
+                )
+            else:
+                WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
+                raise ValueError(
+                    f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}"
+                )
+            return True if return_success else None
+
+        # Case weight_shape
+        if "weight_shape" in weight_name:
+            # only required by compressed-tensors
+            self._load_single_value(
+                param=param, loaded_weight=loaded_weight, expert_id=expert_id
+            )
+            return True if return_success else None
+
+        # Case model weights
+        if "weight" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank,
+            )
+            return True if return_success else None
+
+        return False if return_success else None
+
+    # NOTE(ducct): custom weight loader for expert cache
+    def cached_weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        selected_expert_ids: list[int],
+        key: str,
+        return_success: bool = False,
+    ) -> bool | None:
+        if self.quant_config and self.quant_config.get_name() == "mxfp4":
+            # (FIXME) for gpt-oss all experts are combined
+            if "bias" in weight_name:
+                if "ping" in key:
+                    self.cached_expert_ids_ping = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                elif "pong" in key:
+                    self.cached_expert_ids_pong = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                lw = loaded_weight
+                if lw.dim() == 1:
+                    lw = lw.unsqueeze(0)
+                dim1 = lw.shape[1]
+                param.data[: lw.shape[0], :dim1].copy_(lw)
+            else:
+                if "ping" in key:
+                    self.cached_expert_ids_ping = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                elif "pong" in key:
+                    self.cached_expert_ids_pong = torch.tensor(
+                        selected_expert_ids, device=param.device, dtype=torch.int32
+                    )
+                lw = loaded_weight
+                if lw.dim() == 2:
+                    lw = lw.unsqueeze(0)
+                dim1 = lw.shape[1]
+                dim2 = lw.shape[2]
+                param.data[: lw.shape[0], :dim1, :dim2].copy_(lw)
+            return True if return_success else None
+
+        quant_method_name = self.quant_method.__class__.__name__
+        global_expert_id = expert_id
+        expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
+
+        allow_flashinfer = getattr(self.quant_method, "allow_flashinfer", False)
+        moe_backend = getattr(self.quant_method, "flashinfer_moe_backend", None)
+
+        use_global_sf = (
+            allow_flashinfer
+            and is_flashinfer_supporting_global_sf(moe_backend)
+            and "input_scale" in weight_name
+            and quant_method_name == "ModelOptNvFp4FusedMoE"
+        )
+
+        if expert_id == -1 and not use_global_sf:
+            # Failed to load this param since it's not local to this rank
+            return False if return_success else None
+        # Hereafter, `expert_id` is local physical id
+
+        # compressed-tensors checkpoints with packed weights are stored flipped
+        # TODO (mgoin): check self.quant_method.quant_config.quant_format
+        # against known CompressionFormat enum values that have this quality
+        if self.quant_method.__class__.__name__ in (
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            loaded_weight = loaded_weight.t().contiguous()
+
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+
+        # Fetch the dim to shard the parameter/loaded weight
+        # based on the shard id. This will be whatever
+        # dimension intermediate_size_per_partition is used.
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+            param.data.copy_(loaded_weight)
+            return True if return_success else None
+
+        # Return a view of the weight based on expert
+        expert_data = (
+            loaded_weight
+            if is_gguf_weight
+            else loaded_weight[expert_id]
+            if not use_global_sf
+            else loaded_weight[global_expert_id]
+        )
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+        # Case weight scales, zero_points and offset, weight/input global scales
+        if (
+            "input_scale" in weight_name
+            or "weight_scale" in weight_name
+            or "scale" in weight_name
+            or "zero" in weight_name
+            or "offset" in weight_name
+        ):
+            # load the weight scales and zp based on the quantization scheme
+            # supported weight scales/zp can be found in
+            # FusedMoeWeightScaleSupported
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 self._load_per_channel_weight_scale(
