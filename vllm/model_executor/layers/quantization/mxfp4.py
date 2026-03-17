@@ -909,44 +909,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # 1. Get the unique set of topk_ids -> unique_expert_ids: done
             active_cache = layer.expert_cache.get_active_buffer()
             inactive_cache = layer.expert_cache.get_inactive_buffer()
-            # NOTE(codex): Consume-side synchronization: wait only when this
-            # MoE invocation is about to read the active cache buffer.
-            if (
-                not active_cache.is_avail()
-                and torch.cuda.is_available()
-                and active_cache.prefetch_event is not None
-            ):
-                torch.cuda.current_stream().wait_event(active_cache.prefetch_event)
-                active_cache.avail = True
-            # print(f"active_buffer in mlp: {layer.expert_cache.active_buffer}")
             if layer.expert_cache.active_buffer == "ping":
+                # NOTE(ducct): temporary fix
+                layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_ping
+                #layer.cached_expert_ids_ping = torch.empty(0, dtype=torch.int32, device="cuda")
 
             else:
+                # NOTE(ducct):temporary fix
+                layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
                 cached_expert_ids = layer.cached_expert_ids_pong
+                #layer.cached_expert_ids_pong = torch.empty(0, dtype=torch.int32, device="cuda")
             # 2. Transfer the topk_ids from GPU to CPU to compare with cached_expert_ids: done
-            # SUGGEST(codex): Preserve ping/pong cache metadata written by the
-            # prefetch path; clobbering it to empty defeats cache hit checking
-            # and makes overlap benefits invisible.
-            cached_expert_ids = cached_expert_ids.to(
-                device=topk_ids.device, dtype=torch.int32
-            )
             unique_selected_ids = torch.unique(topk_ids.reshape(-1))
             # 3. Do the checking on GPU
             expert_mask = torch.isin(unique_selected_ids, cached_expert_ids, assume_unique=True) # check if unique_selected_ids is subset of cached_expert_ids
             is_subset = expert_mask.all().item()
 
             if not is_subset:
-                # missing_values = unique_selected_ids[~expert_mask]
+                missing_values = unique_selected_ids[~expert_mask]
                 cached_expert_ids = unique_selected_ids
                 # 4. if there is missing ids in predicted ids, fetch to GPU on demand
-                # TODO(ducct): fetch on-demand missing experts into the cache. 
+                # NOTE(ducct): fetch on-demand missing experts into the cache. 
                 active_cache.fetch_on_demand(layer, cached_expert_ids.to("cpu"))
-            # if not is_subset:
-            #     # SUGGEST(codex): Keep existing permissive behavior as fallback
-            #     # when prefetched experts miss current routing decisions.
-            #     cached_expert_ids = unique_selected_ids
 
+            # OLD: map expert IDs -> cache slot indices from cached_expert_ids.
+            # num_experts = getattr(layer, "num_experts", None) or layer.global_num_experts
+            # cached_expert_ids_dev = cached_expert_ids.to(device=topk_ids.device, dtype=torch.long)
+            # lookup = torch.full(
+            #     (num_experts,),
+            #     -1,
+            #     device=topk_ids.device,
+            #     dtype=torch.int32,
+            # )
+            # lookup[cached_expert_ids_dev] = torch.arange(
+            #     cached_expert_ids_dev.numel(),
+            #     device=topk_ids.device,
+            #     dtype=torch.int32,
+            # )
+            # cached_topk_ids = lookup[topk_ids]
+            # if (cached_topk_ids < 0).any():
+            #     raise RuntimeError("topk_ids contains experts not present in cache.")
             
             # DEBUG(ducct):
             # for slot_id, selected_id in zip(torch.tensor(list(range(cached_expert_ids.numel()))), cached_expert_ids):
@@ -1038,6 +1041,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 device=topk_ids.device,
                 dtype=torch.int32,
             )
+            # OLD:
+            # lookup[cached_expert_ids] = torch.arange(
+            #     cached_expert_ids.numel(),
+            #     device=topk_ids.device,
+            #     dtype=torch.int32,
+            # )
             lookup[lookup_expert_ids] = torch.arange(
                 lookup_expert_ids.numel(),
                 device=topk_ids.device,
@@ -1078,8 +1087,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             # NOTE(ducct): Check if inactive buffer is available (done prefetching).
             # If not available yet, wait on the prefetch event before flipping.
-            # NOTE(codex): Keep old producer-tail synchronization disabled to
-            # allow overlap with later compute; replaced by consume-side wait.
             if not inactive_cache.is_avail():
                 if torch.cuda.is_available() and inactive_cache.prefetch_event is not None:
                     torch.cuda.current_stream().wait_event(inactive_cache.prefetch_event)

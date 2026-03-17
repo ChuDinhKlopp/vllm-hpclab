@@ -276,8 +276,6 @@ class ExpertBuffer(nn.Module):
             requires_grad=False,
         )
 
-        print(f"intermediate_size_per_partition_after_pad: {intermediate_size_per_partition_after_pad}")
-
     def _copy_float8_rows(self, dst, src, expert_ids, n):
         # dst: GPU float8 tensor, src: CPU float8 tensor
         dst_u8 = dst[:n].view(torch.uint8)
@@ -305,77 +303,41 @@ class ExpertBuffer(nn.Module):
         #         local_ids = expert_ids
         local_ids = expert_ids
 
-        # with torch.profiler.record_function("ducct::expert_ids.to_device"):
-        local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
-        if slot_ids is not None:
-            slot_ids = slot_ids.to("cuda", dtype=torch.int) # why slot_ids is init to CPU?
+        with torch.profiler.record_function("expert_ids.to_device"):
+            local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
+            if slot_ids is not None:
+                slot_ids = slot_ids.to(layer.w13_weight.device, dtype=torch.long)
         num_expert_ids = local_ids.numel()
 
-        # with torch.profiler.record_function("ducct::expert_cache.copy_weights"):
         if slot_ids is None:
             slot_ids = torch.arange(
                 num_expert_ids,
-                device="cuda",
-                dtype=torch.int,
+                device=layer.w13_weight.device,
+                dtype=torch.long,
             )
+        # NOTE(ducct): This code yields correct result
+        # self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
+        # self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
+        # self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
+        # self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
 
-        src_w13_scale_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-        src_w2_scale_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-        self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
-        self.w13_weight_scale[slot_ids] = src_w13_scale_u8.to("cuda")
-        self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
-        self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
-        self.w2_weight_scale[slot_ids] = src_w2_scale_u8.to("cuda")
-        self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
-
-        # Get CPU and GPU tensor view
-        # src_w13_weight = layer.w13_weight[local_ids]
-        # src_w13_scale_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-        # src_w13_bias = layer.w13_bias[local_ids]
-        # src_w2_weight = layer.w2_weight[local_ids]
-        # src_w2_scale_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-        # src_w2_bias = layer.w2_bias[local_ids]
-
-        # src_w13_weight = src_w13_weight.contiguous().pin_memory()
-        # src_w13_scale_u8 = src_w13_scale_u8.contiguous().pin_memory()
-        # src_w13_bias = src_w13_bias.contiguous().pin_memory()
-        # src_w2_weight = src_w2_weight.contiguous().pin_memory()
-        # src_w2_scale_u8 = src_w2_scale_u8.contiguous().pin_memory()
-        # src_w2_bias = src_w2_bias.contiguous().pin_memory()
-
-        # dst_w13_weight = self.w13_weight[slot_ids]
         # # float8 scales: index via uint8 view
         # # Use explicit slot_ids so cache rows align with cached_expert_ids.
-        # dst_w13_scale_u8 = self.w13_weight_scale.view(torch.uint8)
-        # dst_w13_bias = self.w13_bias[slot_ids]
-        # dst_w2_weight = self.w2_weight[slot_ids]
-        # # float8 scales: index via uint8 view
-        # # Use explicit slot_ids so cache rows align with cached_expert_ids.
-        # dst_w2_scale_u8 = self.w2_weight_scale.view(torch.uint8)
-        # dst_w2_bias = self.w2_bias[slot_ids]
+        # dst_u8 = self.w13_weight_scale.view(torch.uint8)
+        # src_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
+        # dst_u8[slot_ids] = src_u8.to("cuda")
 
-        # # Move weights H2D
-        # dst_w13_weight.copy_(src_w13_weight, non_blocking=True)
-        # dst_w13_scale_u8.copy_(src_w13_scale_u8, non_blocking=True)
-        # dst_w13_bias.copy_(src_w13_bias, non_blocking=True)
-        # dst_w2_weight.copy_(src_w2_weight, non_blocking=True)
-        # dst_w2_scale_u8.copy_(src_w2_scale_u8, non_blocking=True)
-        # dst_w2_bias.copy_(src_w2_bias, non_blocking=True)
+        # dst_u8 = self.w2_weight_scale.view(torch.uint8)
+        # src_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
+        # dst_u8[slot_ids] = src_u8.to("cuda")
 
-        # for i, expert_id in enumerate(local_ids.tolist()):
-        #     # self.w13_weight[i].copy_(layer.w13_weight[expert_id].pin_memory(), non_blocking=True)
-        #     # self.w13_weight_scale[i].copy_(layer.w13_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     # self.w13_bias[i].copy_(layer.w13_bias[expert_id].pin_memory(), non_blocking=True)
-        #     # self.w2_weight[i].copy_(layer.w2_weight[expert_id].pin_memory(), non_blocking=True)
-        #     # self.w2_weight_scale[i].copy_(layer.w2_weight_scale[expert_id].pin_memory(), non_blocking=True)
-        #     # self.w2_bias[i].copy_(layer.w2_bias[expert_id].pin_memory(), non_blocking=True)
-
-        #     self.w13_weight[i] = layer.w13_weight[expert_id].pin_memory().to("cuda")
-        #     self.w13_weight_scale[i] = layer.w13_weight_scale[expert_id].pin_memory().to("cuda")
-        #     self.w13_bias[i] = layer.w13_bias[expert_id].pin_memory().to("cuda")
-        #     self.w2_weight[i] = layer.w2_weight[expert_id].pin_memory().to("cuda")
-        #     self.w2_weight_scale[i] = layer.w2_weight_scale[expert_id].pin_memory().to("cuda")
-        #     self.w2_bias[i] = layer.w2_bias[expert_id].pin_memory().to("cuda")
+        for i, expert_id in enumerate(local_ids.tolist()):
+            self.w13_weight[i].copy_(layer.w13_weight[expert_id].pin_memory(), non_blocking=True)
+            self.w13_weight_scale[i].copy_(layer.w13_weight_scale[expert_id].pin_memory(), non_blocking=True)
+            self.w13_bias[i].copy_(layer.w13_bias[expert_id].pin_memory(), non_blocking=True)
+            self.w2_weight[i].copy_(layer.w2_weight[expert_id].pin_memory(), non_blocking=True)
+            self.w2_weight_scale[i].copy_(layer.w2_weight_scale[expert_id].pin_memory(), non_blocking=True)
+            self.w2_bias[i].copy_(layer.w2_bias[expert_id].pin_memory(), non_blocking=True)
 
 
 class ExpertCache(nn.Module):
@@ -507,7 +469,7 @@ class ExpertCache(nn.Module):
         else:
             if prefetch_fn is not None:
                 prefetch_fn()
-        inactive_cache.avail = True
+            inactive_cache.avail = True
 
 
 # NOTE(hieuvt): expert_predictor
@@ -955,7 +917,6 @@ class TransformerBlock(torch.nn.Module):
         #     device="cpu",
         # )
         self.top_k = self.mlp.experts.top_k
-        self.compute_stream = torch.cuda.default_stream()
 
 
     def forward(
@@ -970,11 +931,7 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        # NOTE(ducct): profile attn latency
-        with torch.cuda.stream(self.compute_stream):
-            # with torch.profiler.record_function(f"ducct::Layer {envs.LAYER_ID}: attn"):
-                hidden_states = self.attn(hidden_states, positions)
+        hidden_states = self.attn(hidden_states, positions)
         # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
         # predictor runs on CPU -> transfer hidden_states back to CPU for computation
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
@@ -987,50 +944,47 @@ class TransformerBlock(torch.nn.Module):
                 prefetch_stream = self._prefetch_stream
 
             # 1) D2H copy on prefetch stream
+            # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
             with torch.cuda.stream(prefetch_stream):
-                # with torch.profiler.record_function("ducct::expert_prefetch.d2h_hidden_states"):
-                    hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
-            # SUGGEST(codex): Avoid host-side stream synchronization here to
-            # preserve overlap between async expert prefetch and current-layer
-            # MoE compute; synchronize only at true consumption boundaries.
+                hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
+            prefetch_stream.synchronize() # ensure d2h done before CPU prediction
 
             # 2) NOTE(ducct): implement CPU expert predictor
             moe = next_layer.mlp.experts
-            # with torch.profiler.record_function("ducct::expert_predictor"):
+            # with torch.profiler.record_function("expert_predictor"):
             # predicted_ids = self.expert_predictor.predict_batch(
             #     hs_cpu, top_k=self.top_k
             # )["indices"]  # CPU
-            # predicted_ids = torch.tensor(list(range(32)), device="cpu") # gpt-oss-20b
-            # predicted_ids = torch.tensor(list(range(128)), device="cpu") # gpt-oss-120b
-            predicted_ids = torch.tensor([0,4,2,9], device="cpu") # test
+            predicted_ids = torch.tensor([0,4,2,9], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
-            # with torch.profiler.record_function("ducct::expert_ids.check_and_normalize"):
+            # with torch.profiler.record_function("expert_ids.check_and_normalize"):
             predicted_ids = predicted_ids.reshape(-1)
             predicted_ids = torch.unique(predicted_ids)
             max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
             if predicted_ids.numel() > max_cache:
                 predicted_ids = predicted_ids[:max_cache]
 
+            if moe.expert_cache.active_buffer == "ping":
+                moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
+            else:
+                moe.cached_expert_ids_ping = predicted_ids.detach().to("cuda")
+
             # 3) H2D prefetch on prefetch stream
             def do_prefetch():
-                inactive_bf = moe.expert_cache.get_inactive_buffer()
-                inactive_bf.fetch_on_demand(moe, predicted_ids)
-                if moe.expert_cache.active_buffer == "ping":
-                    moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
-                else:
-                    moe.cached_expert_ids_ping = predicted_ids.detach().to("cuda")
+                # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
+                    inactive_bf = moe.expert_cache.get_inactive_buffer()
+                    inactive_bf.fetch_on_demand(moe, predicted_ids)
+                # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
 
+            # with torch.profiler.record_function("expert_prefetch.prefetch"):
             with torch.cuda.stream(prefetch_stream):
-                # with torch.profiler.record_function("ducct::expert_prefetch.prefetch"):
-                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+                moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        with torch.cuda.stream(self.compute_stream):
-            # NOTE(ducct): profile moe latency
-            # with torch.profiler.record_function(f"ducct::Layer {envs.LAYER_ID}: MoE"):
-                output = self.mlp(hidden_states)
+        output = self.mlp(hidden_states)
         return output, residual
 
 
@@ -1131,9 +1085,6 @@ class GptOssModel(nn.Module):
             layer = self.layers[i]
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
-
-            # NOTE(ducct): profile a layer
-            # with torch.profiler.record_function(f"ducct::step {self._hidden_state_step} - layer {i}"):
             x, residual = layer(x, positions, residual)
             # NOTE(ducct): Hidden-state dump (for correctness checks)
             if (
@@ -1868,7 +1819,6 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NOTE(ducct): record forward pass latency
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
