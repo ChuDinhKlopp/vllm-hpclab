@@ -10,7 +10,7 @@ This repository currently supports the following **GPT-OSS** models:
 
 ### 1. Clone the repository
 ```bash
-git clone <repo-url>
+git clone https://github.com/ChuDinhKlopp/vllm-hpclab.git
 cd vllm-hpclab
 ```
 
