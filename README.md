@@ -25,7 +25,7 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install --editable .
 ```
 
-### Run the project
+## Run the project
 Use vllm serve with the local model path and --enforce-eager:
 ```bash
 vllm serve /path/to/gpt-oss-120b --enforce-eager
