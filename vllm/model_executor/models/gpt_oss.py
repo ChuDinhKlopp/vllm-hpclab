@@ -289,19 +289,19 @@ class ExpertBuffer(nn.Module):
 
         # Map global expert ids -> local expert ids when EP is enabled.
         # Filter out experts not owned by this rank (mapped to -1).
-        # with torch.profiler.record_function("expert_ids.map_and_filter"):
-        #     if getattr(layer, "expert_map", None) is not None:
-        #         map_device = layer.expert_map.device
-        #         local_ids = layer.expert_map[
-        #             expert_ids.to(map_device, dtype=torch.long)
-        #         ]
-        #         keep = local_ids >= 0
-        #         if not torch.any(keep):
-        #             return
-        #         local_ids = local_ids[keep]
-        #     else:
-        #         local_ids = expert_ids
-        local_ids = expert_ids
+        with torch.profiler.record_function("expert_ids.map_and_filter"):
+            if getattr(layer, "expert_map", None) is not None:
+                map_device = layer.expert_map.device
+                local_ids = layer.expert_map[
+                    expert_ids.to(map_device, dtype=torch.long)
+                ]
+                keep = local_ids >= 0
+                if not torch.any(keep):
+                    return
+                local_ids = local_ids[keep]
+            else:
+                local_ids = expert_ids
+        # local_ids = expert_ids
 
         with torch.profiler.record_function("expert_ids.to_device"):
             local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
