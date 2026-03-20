@@ -117,10 +117,11 @@ class ExpertBuffer(nn.Module):
                 torch.zeros(
                     (self.num_experts, *source_param.shape[1:]),
                     dtype=source_param.dtype,
-                    device=source_param.device,
+                    # device="cuda",
                 ),
                 requires_grad=False,
             )
+            print(f"cached_param: {cached_param.device}")
             setattr(self, param_name, cached_param)
 
     def _copy_float8_rows(self, dst, src, expert_ids, n):
@@ -203,6 +204,8 @@ class ExpertBuffer(nn.Module):
             for param_name in cached_parameter_names:
                 cache_param = getattr(self, param_name)
                 layer_param = getattr(layer, param_name)
+                # print(f"cache_param: {cache_param.device}")
+                # print(f"layer_param: {layer_param.device}")
                 cache_param[slot_id].copy_(
                     layer_param[expert_id].pin_memory(),
                     non_blocking=True,

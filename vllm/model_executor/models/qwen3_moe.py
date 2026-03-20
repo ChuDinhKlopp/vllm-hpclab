@@ -77,7 +77,115 @@ from .utils import (
 )
 
 # NOTE(ducct):
+import os
+from typing import Dict, List 
+from pathlib import Path
+
 from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache
+
+# Hidden-state dump (for correctness checks)
+ENABLE_HIDDEN_STATE_DUMP = os.getenv("ENABLE_HIDDEN_STATE_DUMP", "0") == "1"
+HIDDEN_STATE_LOG_DIR = Path(
+    os.getenv("HIDDEN_STATE_LOG_DIR", "/run/user/1019/ducct/logs/hidden_state/vllm-pref")
+)
+HIDDEN_STATE_MAX_STEPS_PER_FILE = int(
+    os.getenv("HIDDEN_STATE_MAX_STEPS_PER_FILE", "1")
+)
+HIDDEN_STATE_FLUSH_EVERY_STEP = os.getenv(
+    "HIDDEN_STATE_FLUSH_EVERY_STEP", "0"
+) == "1"
+HIDDEN_STATE_TARGET_LAYER = os.getenv("HIDDEN_STATE_TARGET_LAYER")
+if HIDDEN_STATE_TARGET_LAYER is not None and HIDDEN_STATE_TARGET_LAYER != "":
+    HIDDEN_STATE_TARGET_LAYER = int(HIDDEN_STATE_TARGET_LAYER)
+
+class HiddenStateLogger:
+    def __init__(
+        self,
+        log_dir: Path,
+        max_steps_per_file: int = 1,
+        filename_format: str = "hidden_states_device_{device:01d}_{start:06d}_{end:06d}.pt",
+    ):
+        self.log_dir = log_dir
+        self.max_steps_per_file = max_steps_per_file
+        self.filename_format = filename_format
+        self.buffer: List[Dict] = []
+        self.current_start_step: int | None = None
+        self.current_device_id: int | None = None
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _normalize_device_id(device: torch.device) -> int:
+        if device.type == "cuda":
+            return device.index
+        return 0  # CPU -> device_0
+
+    def _to_cpu(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: self._to_cpu(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            converted = [self._to_cpu(v) for v in value]
+            return type(value)(converted)
+        return value
+
+    def log(
+        self,
+        step: int,
+        layer_id: int,
+        tensor: torch.Tensor,
+        device: torch.device,
+        cached_weights: dict | None = None,
+    ) -> None:
+        device_id = self._normalize_device_id(device)
+        if self.current_device_id is not None and device_id != self.current_device_id:
+            self.flush()
+
+        if self.current_start_step is None:
+            self.current_start_step = step
+            self.current_device_id = device_id
+
+        entry = {
+            "step": step,
+            "layer": layer_id,
+            "tensor": tensor.detach().cpu(),
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device_id": device_id,
+        }
+        if cached_weights is not None:
+            entry["cached_weights"] = self._to_cpu(cached_weights)
+        self.buffer.append(entry)
+
+        if self.max_steps_per_file:
+            if step - self.current_start_step >= self.max_steps_per_file:
+                self.flush()
+        if HIDDEN_STATE_FLUSH_EVERY_STEP:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        steps = [e["step"] for e in self.buffer]
+        start_step = min(steps)
+        end_step = max(steps)
+        device_id = self.current_device_id or 0
+        filename = self.filename_format.format(
+            device=device_id, start=start_step, end=end_step
+        )
+        torch.save(
+            {"entries": self.buffer, "step_range": (start_step, end_step)},
+            self.log_dir / filename,
+        )
+        self.buffer = []
+        self.current_start_step = None
+        self.current_device_id = None
+
+
+hidden_state_logger = HiddenStateLogger(
+    log_dir=HIDDEN_STATE_LOG_DIR,
+    max_steps_per_file=HIDDEN_STATE_MAX_STEPS_PER_FILE,
+)
 
 
 logger = init_logger(__name__)
@@ -505,11 +613,11 @@ class Qwen3MoeModel(nn.Module):
         if owner_fused_moe is None:
             raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
         self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
-        # NOTE(ducct): Share the model-level expert cache across all MoE layers.
+        # Share the model-level expert cache across all MoE layers.
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            # NOTE(ducct): Keep shared cache reachable without registering as a submodule
+            # Keep shared cache reachable without registering as a submodule
             # to avoid per-layer naming prefixes in state_dict/params.
             layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
 
@@ -568,10 +676,10 @@ class Qwen3MoeModel(nn.Module):
                 and hidden_state_step is not None
                 and (
                     HIDDEN_STATE_TARGET_LAYER is None
-                    or HIDDEN_STATE_TARGET_LAYER == i
+                    or HIDDEN_STATE_TARGET_LAYER == layer_idx
                 )
             ):
-                hidden = x if residual is None else x + residual
+                hidden = hidden_states if residual is None else hidden_states + residual
                 cached_weights = None
                 if getattr(self, "expert_cache", None) is not None:
                     active_buffer = self.expert_cache.get_active_buffer()
@@ -592,7 +700,7 @@ class Qwen3MoeModel(nn.Module):
                         cached_weights[param_name] = getattr(active_buffer, param_name)
                 hidden_state_logger.log(
                     step=hidden_state_step,
-                    layer_id=i,
+                    layer_id=layer_idx,
                     tensor=hidden,
                     device=hidden.device,
                     cached_weights=cached_weights,
@@ -760,6 +868,17 @@ class Qwen3MoeModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        # Mark expert cache parameters as initialized even if not from checkpoint.
+        # These are created at runtime and populated by the cache prefetch logic.
+        try:
+            cache_param_names = getattr(self.expert_cache, "cached_parameter_names", ())
+            for param_name in cache_param_names:
+                loaded_params.add(f"expert_cache.expert_cache_ping_{param_name}")
+                loaded_params.add(f"expert_cache.expert_cache_pong_{param_name}")
+        except Exception:
+            # Be defensive: if expert_cache is absent or uninitialized, skip.
+            pass
+
         return loaded_params
 
 

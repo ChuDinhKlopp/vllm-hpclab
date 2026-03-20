@@ -68,7 +68,7 @@ from collections.abc import Iterable, Callable
 # Hidden-state dump (for correctness checks)
 ENABLE_HIDDEN_STATE_DUMP = os.getenv("ENABLE_HIDDEN_STATE_DUMP", "0") == "1"
 HIDDEN_STATE_LOG_DIR = Path(
-    os.getenv("HIDDEN_STATE_LOG_DIR", "/run/user/1009/ducct/logs/hidden_state/vllm-pref")
+    os.getenv("HIDDEN_STATE_LOG_DIR", "/run/user/1019/ducct/logs/hidden_state/vllm-pref")
 )
 HIDDEN_STATE_MAX_STEPS_PER_FILE = int(
     os.getenv("HIDDEN_STATE_MAX_STEPS_PER_FILE", "1")
