@@ -10,7 +10,7 @@ This repository currently supports the following **GPT-OSS** models:
 
 ### 1. Clone the repository
 ```bash
-git clone <repo-url>
+git clone https://github.com/ChuDinhKlopp/vllm-hpclab.git
 cd vllm-hpclab
 ```
 
@@ -25,7 +25,7 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install --editable .
 ```
 
-### Run the project
+## Run the project
 Use vllm serve with the local model path and --enforce-eager:
 ```bash
 vllm serve /path/to/gpt-oss-120b --enforce-eager
