@@ -76,6 +76,10 @@ from .utils import (
     maybe_prefix,
 )
 
+# NOTE(ducct):
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache
+
+
 logger = init_logger(__name__)
 
 
@@ -371,6 +375,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # NOTE(ducct): add expert predictor
+        # self.expert_predictor = ExpertPredictorModel(
+        #     weight_path="/home/ducct/repos/profiling/trace-analysis/vllm-offload/epoch=01-val_acc=0.9493.ckpt",
+        #     input_dim=2880,
+        #     num_experts=config.num_local_experts,
+        #     device="cpu",
+        # )
+        self.top_k = self.mlp.experts.top_k
+
 
     def forward(
         self,
@@ -388,6 +401,55 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
+        # predictor runs on CPU -> transfer hidden_states back to CPU for computation
+        # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
+        # Then we copy this tensor to next layer's cache. How do we access next layer's cache here?
+        next_layer = getattr(self, "next_layer", None)
+        if next_layer is not None and hidden_states.is_cuda:
+            prefetch_stream = getattr(self, "_prefetch_stream", None)
+            if prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream()
+                prefetch_stream = self._prefetch_stream
+
+            # 1) D2H copy on prefetch stream
+            # with torch.profiler.record_function("expert_prefetch.d2h_hidden_states"):
+            with torch.cuda.stream(prefetch_stream):
+                hs_cpu = hidden_states.detach().to("cpu", non_blocking=True)
+            prefetch_stream.synchronize() # ensure d2h done before CPU prediction
+
+            # 2) NOTE(ducct): implement CPU expert predictor
+            moe = next_layer.mlp.experts
+            # with torch.profiler.record_function("ducct::expert_predictor"):
+            #     predicted_ids = self.expert_predictor.predict_batch(
+            #         hs_cpu, top_k=self.top_k
+            #     )["indices"]  # CPU
+            predicted_ids = torch.tensor([0,4,2,9], device="cpu")
+
+            # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
+            # with torch.profiler.record_function("expert_ids.check_and_normalize"):
+            predicted_ids = predicted_ids.reshape(-1)
+            predicted_ids = torch.unique(predicted_ids)
+            max_cache = moe.expert_cache.ping_buffer.w13_weight.shape[0]
+            if predicted_ids.numel() > max_cache:
+                predicted_ids = predicted_ids[:max_cache]
+
+            # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
+            if moe.expert_cache.active_buffer == "ping":
+                moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
+            else:
+                moe.cached_expert_ids_ping = predicted_ids.detach().to("cuda")
+
+            # 3) H2D prefetch on prefetch stream
+            def do_prefetch():
+                # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
+                    inactive_bf = moe.expert_cache.get_inactive_buffer()
+                    inactive_bf.fetch_on_demand(moe, predicted_ids)
+
+            with torch.cuda.stream(prefetch_stream):
+                with torch.profiler.record_function("ducct::prefetch"):
+                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -420,12 +482,47 @@ class Qwen3MoeModel(nn.Module):
             lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+
+        # NOTE(ducct): Link neighboring layers without registering as submodules.
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, PPMissingLayer):
+                continue
+            next_layer = self.layers[i + 1] if i + 1 < len(self.layers) else None
+            layer.__dict__["next_layer"] = next_layer
+
+        # NOTE(ducct): init expert cache
+        self.expert_cache = ExpertCache(
+            num_experts=self.config.num_experts
+        )
+
+        owner_fused_moe = next(
+            (
+                layer.mlp.experts for layer in self.layers
+                if not isinstance(layer, PPMissingLayer)
+            ),
+            None,
+        )
+        if owner_fused_moe is None:
+            raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
+        self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
+        # NOTE(ducct): Share the model-level expert cache across all MoE layers.
+        for layer in self.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            # NOTE(ducct): Keep shared cache reachable without registering as a submodule
+            # to avoid per-layer naming prefixes in state_dict/params.
+            layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
+
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
         # Track layers for auxiliary hidden state outputs (EAGLE3)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        # NOTE(ducct): 
+        self._hidden_state_step = 0
+
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -437,6 +534,11 @@ class Qwen3MoeModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # NOTE(ducct):
+        if ENABLE_HIDDEN_STATE_DUMP:
+            self._hidden_state_step += 1
+            hidden_state_step = self._hidden_state_step
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -460,6 +562,41 @@ class Qwen3MoeModel(nn.Module):
                 )
                 aux_hidden_states.append(aux_hidden_state)
             hidden_states, residual = layer(positions, hidden_states, residual)
+            # NOTE(ducct): Hidden-state dump (for correctness checks)
+            if (
+                ENABLE_HIDDEN_STATE_DUMP
+                and hidden_state_step is not None
+                and (
+                    HIDDEN_STATE_TARGET_LAYER is None
+                    or HIDDEN_STATE_TARGET_LAYER == i
+                )
+            ):
+                hidden = x if residual is None else x + residual
+                cached_weights = None
+                if getattr(self, "expert_cache", None) is not None:
+                    active_buffer = self.expert_cache.get_active_buffer()
+                    # OLD(ducct): unconditional MXFP4-only dump payload.
+                    # cached_weights = {
+                    #     "active_buffer": self.expert_cache.active_buffer,
+                    #     "w13_weight": active_buffer.w13_weight,
+                    #     "w13_weight_scale": active_buffer.w13_weight_scale,
+                    #     "w13_bias": active_buffer.w13_bias,
+                    #     "w2_weight": active_buffer.w2_weight,
+                    #     "w2_weight_scale": active_buffer.w2_weight_scale,
+                    #     "w2_bias": active_buffer.w2_bias,
+                    # }
+                    cached_weights = {
+                        "active_buffer": self.expert_cache.active_buffer,
+                    }
+                    for param_name in self.expert_cache.cached_parameter_names:
+                        cached_weights[param_name] = getattr(active_buffer, param_name)
+                hidden_state_logger.log(
+                    step=hidden_state_step,
+                    layer_id=i,
+                    tensor=hidden,
+                    device=hidden.device,
+                    cached_weights=cached_weights,
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

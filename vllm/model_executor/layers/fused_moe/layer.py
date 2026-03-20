@@ -1927,6 +1927,7 @@ class FusedMoE(CustomOp):
                 )
 
             # Matrix multiply.
+            # logger.info(f"[ducct] quant_method: {self.quant_method}")
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states_combined

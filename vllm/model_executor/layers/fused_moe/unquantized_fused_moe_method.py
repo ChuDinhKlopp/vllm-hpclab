@@ -208,6 +208,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
         layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
 
+        # NOTE(ducct):
+        layer.expert_cache.ping_buffer.w13_weight.data = self._maybe_pad_weight(layer.expert_cache.ping_buffer.w13_weight.data)
+        layer.expert_cache.pong_buffer.w13_weight.data = self._maybe_pad_weight(layer.expert_cache.pong_buffer.w13_weight.data)
+        layer.expert_cache.ping_buffer.w2_weight.data = self._maybe_pad_weight(layer.expert_cache.ping_buffer.w2_weight.data)
+        layer.expert_cache.pong_buffer.w2_weight.data = self._maybe_pad_weight(layer.expert_cache.pong_buffer.w2_weight.data)
+
+
         if self.rocm_aiter_moe_enabled:
             shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
                 layer.w13_weight.data, layer.w2_weight.data

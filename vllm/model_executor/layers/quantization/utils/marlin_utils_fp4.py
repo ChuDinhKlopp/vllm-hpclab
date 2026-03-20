@@ -221,8 +221,22 @@ def prepare_moe_fp4_cache_for_marlin(
     k = layer.hidden_size
     n = layer.intermediate_size_per_partition
     # WORKSPACE
-    device = layer.expert_cache.ping_buffer.w13_weight.device # NOTE(ducct): added expert_cache_ prefix
+    # OLD(ducct): device = layer.expert_cache.ping_buffer.w13_weight.device
+    device = layer.w13_weight.device
     param_dtype = layer.params_dtype
+    for buffer in (layer.expert_cache.ping_buffer, layer.expert_cache.pong_buffer):
+        for param_name in layer.expert_cache.cached_parameter_names:
+            param = getattr(buffer, param_name)
+            if param.device == device:
+                continue
+            setattr(
+                buffer,
+                param_name,
+                torch.nn.Parameter(
+                    param.to(device=device),
+                    requires_grad=False,
+                ),
+            )
     layer.workspace = marlin_make_workspace_new(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1

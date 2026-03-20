@@ -53,6 +53,8 @@ import vllm.envs as envs
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.math_utils import round_up
 
+from vllm.model_executor.layers.expert_prefetch import ExpertPredictorModel, ExpertCache
+
 import time
 import os
 import json
@@ -166,579 +168,6 @@ hidden_state_logger = HiddenStateLogger(
     log_dir=HIDDEN_STATE_LOG_DIR,
     max_steps_per_file=HIDDEN_STATE_MAX_STEPS_PER_FILE,
 )
-
-
-class ExpertBuffer(nn.Module):
-    w13_weight: torch.Tensor
-    w13_weight_scale: torch.Tensor
-    w13_bias: torch.Tensor
-    w2_weight: torch.Tensor
-    w2_weight_scale: torch.Tensor
-    w2_bias: torch.Tensor
-
-    def __init__(self, num_experts: int, name: str):
-        super().__init__()
-        self.num_experts = num_experts
-        # Keep cached expert IDs on GPU when available to avoid CPU<->GPU hops.
-        device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-        self.cached_expert_ids: torch.Tensor = torch.empty(
-            0, dtype=torch.int32, device=device
-        )
-        self.avail = True
-        self.prefetch_event: torch.cuda.Event | None = None
-
-    def record_expert_ids(self, expert_ids: torch.Tensor):
-        self.cached_expert_ids = expert_ids
-
-    def get_cached_expert_ids(self):
-        return self.cached_expert_ids
-
-    def is_avail(self):
-        return self.avail
-
-    def create_buffer(
-        self,
-        config,
-        mxfp4_block: int,
-        weight_dtype: torch.dtype,
-        scale_dtype: torch.dtype,
-    ):
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        tp_size = get_tensor_model_parallel_world_size()
-        assert intermediate_size % tp_size == 0
-        intermediate_size_per_partition = intermediate_size // tp_size
-        intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        intermediate_size_per_partition_after_pad = round_up(
-            intermediate_size_per_partition, 128
-        )
-        if current_platform.is_xpu():
-            hidden_size = round_up(hidden_size, 128)
-        else:
-            hidden_size = round_up(hidden_size, 256)
-
-        self.w13_weight: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // 2,
-                dtype=weight_dtype,
-            ),
-            requires_grad=False,
-        )
-        self.w13_weight_scale: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
-                dtype=scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        self.w13_bias: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        self.w2_weight: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
-                dtype=weight_dtype,
-            ),
-            requires_grad=False,
-        )
-        # w2 scale
-        self.w2_weight_scale: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
-                dtype=scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        # w2 bias
-        self.w2_bias: torch.Tensor = torch.nn.Parameter(
-            torch.zeros(
-                self.num_experts,  # NOTE(ducct): expert cache size
-                hidden_size,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-
-    def _copy_float8_rows(self, dst, src, expert_ids, n):
-        # dst: GPU float8 tensor, src: CPU float8 tensor
-        dst_u8 = dst[:n].view(torch.uint8)
-        src_u8 = src.view(torch.uint8)[expert_ids]
-        dst_u8.copy_(src_u8)
-
-    def fetch_on_demand(self, layer, expert_ids, slot_ids: torch.Tensor | None = None):
-        expert_ids = expert_ids.reshape(-1)
-        if expert_ids.numel() == 0:
-            return
-
-        # Map global expert ids -> local expert ids when EP is enabled.
-        # Filter out experts not owned by this rank (mapped to -1).
-        with torch.profiler.record_function("expert_ids.map_and_filter"):
-            if getattr(layer, "expert_map", None) is not None:
-                map_device = layer.expert_map.device
-                local_ids = layer.expert_map[
-                    expert_ids.to(map_device, dtype=torch.long)
-                ]
-                keep = local_ids >= 0
-                if not torch.any(keep):
-                    return
-                local_ids = local_ids[keep]
-            else:
-                local_ids = expert_ids
-        # local_ids = expert_ids
-
-        with torch.profiler.record_function("expert_ids.to_device"):
-            local_ids = local_ids.to(layer.w13_weight.device, dtype=torch.long)
-            if slot_ids is not None:
-                slot_ids = slot_ids.to(layer.w13_weight.device, dtype=torch.long)
-        num_expert_ids = local_ids.numel()
-
-        if slot_ids is None:
-            slot_ids = torch.arange(
-                num_expert_ids,
-                device=layer.w13_weight.device,
-                dtype=torch.long,
-            )
-        # NOTE(ducct): This code yields correct result
-        # self.w13_weight[slot_ids] = layer.w13_weight[local_ids].to("cuda")
-        # self.w13_bias[slot_ids] = layer.w13_bias[local_ids].to("cuda")
-        # self.w2_weight[slot_ids] = layer.w2_weight[local_ids].to("cuda")
-        # self.w2_bias[slot_ids] = layer.w2_bias[local_ids].to("cuda")
-
-        # # float8 scales: index via uint8 view
-        # # Use explicit slot_ids so cache rows align with cached_expert_ids.
-        # dst_u8 = self.w13_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w13_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        # dst_u8 = self.w2_weight_scale.view(torch.uint8)
-        # src_u8 = layer.w2_weight_scale.view(torch.uint8)[local_ids]
-        # dst_u8[slot_ids] = src_u8.to("cuda")
-
-        for i, expert_id in enumerate(local_ids.tolist()):
-            self.w13_weight[i].copy_(layer.w13_weight[expert_id].pin_memory(), non_blocking=True)
-            self.w13_weight_scale[i].copy_(layer.w13_weight_scale[expert_id].pin_memory(), non_blocking=True)
-            self.w13_bias[i].copy_(layer.w13_bias[expert_id].pin_memory(), non_blocking=True)
-            self.w2_weight[i].copy_(layer.w2_weight[expert_id].pin_memory(), non_blocking=True)
-            self.w2_weight_scale[i].copy_(layer.w2_weight_scale[expert_id].pin_memory(), non_blocking=True)
-            self.w2_bias[i].copy_(layer.w2_bias[expert_id].pin_memory(), non_blocking=True)
-
-
-class ExpertCache(nn.Module):
-    def __init__(self, num_experts):
-        super().__init__()
-        self.ping_buffer = ExpertBuffer(num_experts=num_experts, name="ping")
-        self.pong_buffer = ExpertBuffer(num_experts=num_experts, name="pong")
-        self.active_buffer = "ping"
-        # Bound at model init so we can reuse FusedMoE's loader logic.
-        self.owner_fused_moe: FusedMoE | None = None
-
-    # NOTE(ducct): custom weight loader for expert cache
-    def cached_weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        selected_expert_ids: list[int],
-        key: str,
-        return_success: bool = False,
-    ) -> bool | None:
-        owner = self.owner_fused_moe
-        if owner is None:
-            raise AttributeError(
-                "ExpertCache.owner_fused_moe is not set; cannot reuse "
-                "FusedMoE.cached_weight_loader."
-            )
-        return FusedMoE.cached_weight_loader(
-            owner,
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-            selected_expert_ids=selected_expert_ids,
-            key=key,
-            return_success=return_success,
-        )
-
-
-    def create_cache(
-        self,
-        config,
-        mxfp4_block,
-        weight_dtype,
-        scale_dtype,
-    ):
-        extra_weight_attrs = {
-            "cached_weight_loader": self.cached_weight_loader
-        }
-        # Avoid reallocating shared buffers if they already exist.
-        if (
-            self.ping_buffer is not None
-            and self.pong_buffer is not None
-            and getattr(self.ping_buffer, "w13_weight", None) is not None
-            and getattr(self.pong_buffer, "w13_weight", None) is not None
-        ):
-            return
-        self.ping_buffer.create_buffer(
-            config,
-            mxfp4_block,
-            weight_dtype,
-            scale_dtype,
-        )
-        self.register_parameter("expert_cache_ping_w13_weight", self.ping_buffer.w13_weight)
-        set_weight_attrs(self.ping_buffer.w13_weight, extra_weight_attrs)
-        self.register_parameter("expert_cache_ping_w13_weight_scale", self.ping_buffer.w13_weight_scale)
-        set_weight_attrs(self.ping_buffer.w13_weight_scale, extra_weight_attrs)
-        self.register_parameter("expert_cache_ping_w13_bias", self.ping_buffer.w13_bias)
-        set_weight_attrs(self.ping_buffer.w13_bias, extra_weight_attrs)
-        self.register_parameter("expert_cache_ping_w2_weight", self.ping_buffer.w2_weight)
-        set_weight_attrs(self.ping_buffer.w2_weight, extra_weight_attrs)
-        self.register_parameter("expert_cache_ping_w2_weight_scale", self.ping_buffer.w2_weight_scale)
-        set_weight_attrs(self.ping_buffer.w2_weight_scale, extra_weight_attrs)
-        self.register_parameter("expert_cache_ping_w2_bias", self.ping_buffer.w2_bias)
-        set_weight_attrs(self.ping_buffer.w2_bias, extra_weight_attrs)
-
-        self.pong_buffer.create_buffer(
-            config,
-            mxfp4_block,
-            weight_dtype,
-            scale_dtype,
-        )
-        self.register_parameter("expert_cache_pong_w13_weight", self.pong_buffer.w13_weight)
-        set_weight_attrs(self.pong_buffer.w13_weight, extra_weight_attrs)
-        self.register_parameter("expert_cache_pong_w13_weight_scale", self.pong_buffer.w13_weight_scale)
-        set_weight_attrs(self.pong_buffer.w13_weight_scale, extra_weight_attrs)
-        self.register_parameter("expert_cache_pong_w13_bias", self.pong_buffer.w13_bias)
-        set_weight_attrs(self.pong_buffer.w13_bias, extra_weight_attrs)
-        self.register_parameter("expert_cache_pong_w2_weight", self.pong_buffer.w2_weight)
-        set_weight_attrs(self.pong_buffer.w2_weight, extra_weight_attrs)
-        self.register_parameter("expert_cache_pong_w2_weight_scale", self.pong_buffer.w2_weight_scale)
-        set_weight_attrs(self.pong_buffer.w2_weight_scale, extra_weight_attrs)
-        self.register_parameter("expert_cache_pong_w2_bias", self.pong_buffer.w2_bias)
-        set_weight_attrs(self.pong_buffer.w2_bias, extra_weight_attrs)
-
-    def get_active_buffer(self):
-        if self.active_buffer == "ping":
-            return self.ping_buffer
-        return self.pong_buffer
-
-    def get_inactive_buffer(self):
-        if self.active_buffer == "ping":
-            return self.pong_buffer
-        return self.ping_buffer
-
-    def flip_active_buffer(self):
-        self.active_buffer = "pong" if self.active_buffer == "ping" else "ping"
-
-    def prefetch(
-        self,
-        predicted_expert_ids,
-        prefetch_fn: Callable[[], None] | None = None,
-        stream: torch.cuda.Stream | None = None,
-    ):
-        # NOTE(ducct): mark inactive buffer unavailable and record completion event.
-        inactive_cache = self.get_inactive_buffer()
-        inactive_cache.avail = False
-        if torch.cuda.is_available():
-            if stream is None:
-                stream = torch.cuda.current_stream()
-            with torch.cuda.stream(stream):
-                if prefetch_fn is not None:
-                    prefetch_fn()
-                inactive_cache.prefetch_event = torch.cuda.Event()
-                inactive_cache.prefetch_event.record(stream)
-        else:
-            if prefetch_fn is not None:
-                prefetch_fn()
-            inactive_cache.avail = True
-
-
-# NOTE(hieuvt): expert_predictor
-class Architecture2(nn.Module):
-    """
-    Architecture: Linear -> SiLU -> Linear
-    
-    Args:
-        input_dim (int): Input dimension
-        num_experts (int): Number of expert outputs
-        hidden_dim (int): Hidden dimension (default: 2048)
-    """
-    
-    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int = 2048):
-        super().__init__()
-        
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.SiLU()
-        self.linear2 = nn.Linear(hidden_dim, num_experts)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, input_dim)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, num_experts)
-        """
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        return x
-
-class ExpertPredictor:
-    """
-    Wrapper class for easy inference with the trained expert prediction model (Architecture2).
-    
-    Supports:
-    - Single sample and batch inference
-    - Top-K expert extraction
-    - GPU and CPU execution
-    - Probability output
-    - Direct weight loading from checkpoint
-    """
-    
-    def __init__(self, weight_path: str, input_dim: int = 2880, num_experts: int= 128, 
-                 hidden_dim: int = 2048, device: str = 'cuda', verbose: bool = False):
-        """
-        Initialize the predictor by loading weights.
-        
-        Args:
-            weight_path (str): Path to the checkpoint file (.ckpt or .pt)
-            input_dim (int): Input dimension
-            num_experts (int): Number of experts
-            hidden_dim (int): Hidden dimension (default: 2048)
-            device (str): Device to use ('cuda' or 'cpu')
-            verbose (bool): Whether to print loading information
-        """
-        self.weight_path = weight_path
-        self.device = device
-        self.verbose = verbose
-        self.input_dim = input_dim
-        self.num_experts = num_experts
-        self.hidden_dim = hidden_dim
-        
-        # Validate checkpoint exists
-        if not os.path.exists(weight_path):
-            raise FileNotFoundError(f"Weight file not found: {weight_path}")
-        
-        # Initialize model
-        if self.verbose:
-            print(f"🔄 Initializing Architecture2 model...")
-            print(f"  - Input Dim: {input_dim}")
-            print(f"  - Hidden Dim: {hidden_dim}")
-            print(f"  - Num Experts: {num_experts}")
-        
-        self.model = Architecture2(
-            input_dim=input_dim,
-            num_experts=num_experts,
-            hidden_dim=hidden_dim,
-        )
-        self.model = self.model.to(device)
-        
-        # Load weights
-        if self.verbose:
-            print(f"🔄 Loading weights from: {weight_path}")
-        
-        self._load_weights(weight_path)
-        self.model.eval()  # Set to evaluation mode
-        
-        if self.verbose:
-            print(f"✓ Model loaded successfully")
-            print(f"  - Device: {self.device}")
-            print(f"  - Total Parameters: {self._count_parameters():,}")
-    
-    def _load_weights(self, weight_path: str):
-        """Load weights from checkpoint (handles both PyTorch Lightning .ckpt and .pt formats)"""
-        try:
-            # Try loading as PyTorch Lightning checkpoint first
-            if weight_path.endswith('.ckpt'):
-                checkpoint = torch.load(weight_path, map_location=self.device)
-                
-                # Extract state dict from Lightning checkpoint
-                if 'state_dict' in checkpoint:
-                    state_dict = checkpoint['state_dict']
-                    # Remove 'model.' prefix if it exists (from Lightning wrapper)
-                    new_state_dict = {}
-                    for key, value in state_dict.items():
-                        # Handle keys like 'model.linear1.weight' -> 'linear1.weight'
-                        if key.startswith('model.'):
-                            new_key = key.replace('model.', '', 1)
-                        else:
-                            new_key = key
-                        new_state_dict[new_key] = value
-                    state_dict = new_state_dict
-                
-                self.model.load_state_dict(state_dict)
-            else:
-                # Regular .pt file
-                state_dict = torch.load(weight_path, map_location=self.device)
-                self.model.load_state_dict(state_dict)
-                
-            if self.verbose:
-                print(f"✓ Weights loaded successfully")
-        except RuntimeError as e:
-            # Handle size mismatch errors with helpful message
-            if "size mismatch" in str(e):
-                if "linear1.weight" in str(e):
-                    # Extract actual input dimension from checkpoint
-                    print(f"\n❌ Error loading weights: {e}\n")
-                    print(f"📌 This usually means your --input-dim parameter is wrong!")
-                    print(f"\nTip: The checkpoint was trained with a different input dimension.")
-                    print(f"Try using one of these common values:")
-                    print(f"  - 2880 (GPT hidden_dim)")
-                    print(f"  - 4096 (Standard LLM hidden_dim)")
-                    print(f"\nExample:")
-                    print(f"  python inference.py --weight-path {self.weight_path} --input-dim 2880")
-            raise
-        except Exception as e:
-            print(f"❌ Error loading weights: {e}")
-            raise
-    
-    def _count_parameters(self) -> int:
-        """Count total number of parameters in the model"""
-        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-
-
-    def predict(self, x: torch.Tensor, return_probabilities: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Predict expert selection for input samples.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch_size, input_dim]
-            return_probabilities (bool): If True, return both logits and probabilities
-        
-        Returns:
-            torch.Tensor: Predicted logits [batch_size, num_experts]
-            torch.Tensor (optional): Probabilities if return_probabilities=True
-        """
-        if x.dim() != 2:
-            raise ValueError(f"Expected 2D input tensor [batch_size, input_dim], got shape {x.shape}")
-        
-        if x.shape[1] != self.input_dim:
-            raise ValueError(f"Input dimension mismatch. Expected {self.input_dim}, got {x.shape[1]}")
-        
-        # Move input to device
-        x = x.to(self.device)
-        
-        # Forward pass
-        with torch.no_grad():
-            logits = self.model(x)
-        
-        if return_probabilities:
-            probs = F.softmax(logits, dim=-1)
-            return logits, probs
-        
-        return logits
-
-    def predict_top_k(self, x: torch.Tensor, top_k: int = 4) -> Dict[str, torch.Tensor]:
-        """
-        Predict top-K experts for given input.
-        
-        Args:
-            x (torch.Tensor): Input tensor [batch_size, input_dim]
-            top_k (int): Number of top experts to return
-        
-        Returns:
-            dict: Contains 'indices', 'scores', and 'probabilities'
-        """
-        logits = self.predict(x)
-        
-        # Get top-K values and indices
-        topk_scores, topk_indices = torch.topk(logits, k=min(top_k, logits.shape[-1]), dim=-1)
-        
-        # Get probabilities
-        probs = F.softmax(logits, dim=-1)
-        topk_probs = torch.gather(probs, -1, topk_indices)
-        
-        return {
-            'indices': topk_indices,
-            'scores': topk_scores,
-            'probabilities': topk_probs,
-            'logits': logits
-        }
-
-    def predict_batch(self, x: torch.Tensor, top_k: int = 4) -> Dict[str, torch.Tensor]:
-        """
-        Simple batch inference - just get top-K experts and scores.
-        
-        Args:
-            x (torch.Tensor): Input tensor [batch_size, input_dim]
-            top_k (int): Number of top experts to return
-        
-        Returns:
-            dict: {
-                'indices': [batch_size, top_k],
-                'scores': [batch_size, top_k]
-            }
-        """
-        logits = self.predict(x)
-        
-        # Get top-K values and indices
-        topk_scores, topk_indices = torch.topk(logits, k=min(top_k, logits.shape[-1]), dim=-1)
-        
-        return {
-            'indices': topk_indices,
-            'scores': topk_scores
-        }
-
-    def measure_inference_time(self, x: torch.Tensor, num_runs: int = 10, return_stats: bool = True) -> Union[float, Dict]:
-        """
-        Measure average inference time.
-        
-        Args:
-            x (torch.Tensor): Input tensor
-            num_runs (int): Number of runs for averaging
-            return_stats (bool): If True, return dict with statistics
-        
-        Returns:
-            float or dict: Average time in milliseconds (or dict with detailed stats)
-        """
-        x = x.to(self.device)
-        
-        # Warmup
-        with torch.no_grad():
-            _ = self.model(x)
-        
-        # Measure
-        times = []
-        for _ in range(num_runs):
-            start = time.perf_counter()
-            with torch.no_grad():
-                _ = self.model(x)
-            end = time.perf_counter()
-            times.append((end - start) * 1000)  # Convert to ms
-        
-        if return_stats:
-            return {
-                'avg_ms': np.mean(times),
-                'min_ms': np.min(times),
-                'max_ms': np.max(times),
-                'std_ms': np.std(times),
-                'num_runs': num_runs,
-                'batch_size': x.shape[0]
-            }
-        else:
-            return np.mean(times)
 
 
 class OAIAttention(nn.Module):
@@ -910,7 +339,7 @@ class TransformerBlock(torch.nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         # NOTE(ducct): add expert predictor
-        # self.expert_predictor = ExpertPredictor(
+        # self.expert_predictor = ExpertPredictorModel(
         #     weight_path="/home/ducct/repos/profiling/trace-analysis/vllm-offload/epoch=01-val_acc=0.9493.ckpt",
         #     input_dim=2880,
         #     num_experts=config.num_local_experts,
@@ -926,12 +355,14 @@ class TransformerBlock(torch.nn.Module):
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.attn(hidden_states, positions)
+        with torch.profiler.record_function("ducct::layer_norm+attn"):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.attn(hidden_states, positions)
+
         # TODO(ducct): Predict + prefetch expert weights for next layer here only if you want to prefectch after attn
         # predictor runs on CPU -> transfer hidden_states back to CPU for computation
         # The output of the expert predictor, predicted_topk_ids is used to form a CPU tensor of size (num_predicted_experts, inter_dim, hidden_dim)
@@ -951,10 +382,10 @@ class TransformerBlock(torch.nn.Module):
 
             # 2) NOTE(ducct): implement CPU expert predictor
             moe = next_layer.mlp.experts
-            # with torch.profiler.record_function("expert_predictor"):
-            # predicted_ids = self.expert_predictor.predict_batch(
-            #     hs_cpu, top_k=self.top_k
-            # )["indices"]  # CPU
+            # with torch.profiler.record_function("ducct::expert_predictor"):
+            #     predicted_ids = self.expert_predictor.predict_batch(
+            #         hs_cpu, top_k=self.top_k
+            #     )["indices"]  # CPU
             predicted_ids = torch.tensor([0,4,2,9], device="cpu")
 
             # NOTE(ducct):Normalize predicted ids to a unique 1D list (cache expects <= num_experts).
@@ -965,6 +396,7 @@ class TransformerBlock(torch.nn.Module):
             if predicted_ids.numel() > max_cache:
                 predicted_ids = predicted_ids[:max_cache]
 
+            # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
             if moe.expert_cache.active_buffer == "ping":
                 moe.cached_expert_ids_pong = predicted_ids.detach().to("cuda")
             else:
@@ -975,16 +407,17 @@ class TransformerBlock(torch.nn.Module):
                 # with torch.profiler.record_function("expert_prefetch.fetch_on_demand"):
                     inactive_bf = moe.expert_cache.get_inactive_buffer()
                     inactive_bf.fetch_on_demand(moe, predicted_ids)
-                # with torch.profiler.record_function("expert_ids.h2d_cache_ids"):
 
-            # with torch.profiler.record_function("expert_prefetch.prefetch"):
             with torch.cuda.stream(prefetch_stream):
-                moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
+                with torch.profiler.record_function("ducct::prefetch"):
+                    moe.expert_cache.prefetch(predicted_ids, prefetch_fn=do_prefetch, stream=prefetch_stream)
 
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        output = self.mlp(hidden_states)
+        with torch.profiler.record_function("ducct::layer_norm+moe"):
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            output = self.mlp(hidden_states)
+
         return output, residual
 
 
@@ -1025,19 +458,28 @@ class GptOssModel(nn.Module):
         self.expert_cache = ExpertCache(
             num_experts=self.config.num_local_experts
         )
-        self.expert_cache.create_cache(
-            config=self.config,
-            mxfp4_block=32,
-            weight_dtype=torch.uint8,
-            scale_dtype=torch.uint8,
+        # OLD(ducct): MXFP4-specific cache creation.
+        # self.expert_cache.create_cache(
+        #     config=self.config,
+        #     mxfp4_block=32,
+        #     weight_dtype=torch.uint8,
+        #     scale_dtype=torch.uint8,
+        # )
+        owner_fused_moe = next(
+            (
+                layer.mlp.experts for layer in self.layers
+                if not isinstance(layer, PPMissingLayer)
+            ),
+            None,
         )
+        if owner_fused_moe is None:
+            raise RuntimeError("Failed to find a local FusedMoE layer for expert cache.")
+        self.expert_cache.create_cache(owner_fused_moe=owner_fused_moe)
         # NOTE(ducct): Share the model-level expert cache across all MoE layers.
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if self.expert_cache.owner_fused_moe is None:
-                self.expert_cache.owner_fused_moe = layer.mlp.experts
-            # Keep shared cache reachable without registering as a submodule
+            # NOTE(ducct): Keep shared cache reachable without registering as a submodule
             # to avoid per-layer naming prefixes in state_dict/params.
             layer.mlp.experts.__dict__["expert_cache"] = self.expert_cache
 
@@ -1099,15 +541,21 @@ class GptOssModel(nn.Module):
                 cached_weights = None
                 if getattr(self, "expert_cache", None) is not None:
                     active_buffer = self.expert_cache.get_active_buffer()
+                    # OLD(ducct): unconditional MXFP4-only dump payload.
+                    # cached_weights = {
+                    #     "active_buffer": self.expert_cache.active_buffer,
+                    #     "w13_weight": active_buffer.w13_weight,
+                    #     "w13_weight_scale": active_buffer.w13_weight_scale,
+                    #     "w13_bias": active_buffer.w13_bias,
+                    #     "w2_weight": active_buffer.w2_weight,
+                    #     "w2_weight_scale": active_buffer.w2_weight_scale,
+                    #     "w2_bias": active_buffer.w2_bias,
+                    # }
                     cached_weights = {
                         "active_buffer": self.expert_cache.active_buffer,
-                        "w13_weight": active_buffer.w13_weight,
-                        "w13_weight_scale": active_buffer.w13_weight_scale,
-                        "w13_bias": active_buffer.w13_bias,
-                        "w2_weight": active_buffer.w2_weight,
-                        "w2_weight_scale": active_buffer.w2_weight_scale,
-                        "w2_bias": active_buffer.w2_bias,
                     }
+                    for param_name in self.expert_cache.cached_parameter_names:
+                        cached_weights[param_name] = getattr(active_buffer, param_name)
                 hidden_state_logger.log(
                     step=hidden_state_step,
                     layer_id=i,
